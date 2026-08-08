@@ -1,14 +1,12 @@
 # backend/tests/conftest.py
 import os
 
+os.environ["DATABASE_URL"] = os.environ.get("DATABASE_URL_TEST", "postgresql+psycopg://localhost/richpanel_test")
+
 import pytest
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import text
 
-TEST_DATABASE_URL = os.environ.get("DATABASE_URL_TEST", "postgresql+psycopg://localhost/richpanel_test")
-
-test_engine = create_engine(TEST_DATABASE_URL)
-TestSessionFactory = sessionmaker(bind=test_engine, expire_on_commit=False)
+from app.db import engine, SessionFactory
 
 TABLES_IN_FK_ORDER = [
     "resolution_report_agent_hours",
@@ -23,10 +21,10 @@ TABLES_IN_FK_ORDER = [
 @pytest.fixture
 def db(): # noqa: PT004 - fixture provides a session, not asserted directly
     """A plain session against the test database, truncated clean after each test."""
-    session = TestSessionFactory()
+    session = SessionFactory()
     try:
         yield session
     finally:
         session.close()
-        with test_engine.begin() as conn:
+        with engine.begin() as conn:
             conn.execute(text(f"TRUNCATE {', '.join(TABLES_IN_FK_ORDER)} RESTART IDENTITY CASCADE"))
