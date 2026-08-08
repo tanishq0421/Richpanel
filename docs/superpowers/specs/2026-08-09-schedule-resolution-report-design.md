@@ -58,7 +58,7 @@ Row-level locking (`SELECT ... FOR UPDATE` on existing `schedule_agents` rows) w
 
 ### 4.5 Overnight (midnight-crossing) shifts: split-row normalization
 
-Shifts that cross midnight (e.g. 22:00–06:00) are normalized at write time into two ordinary same-day rows: a **primary** row ending at `end_offset = interval '24:00:00'` (end of day) on the starting weekday, and a **tail** row starting at `start_offset = interval '0'` on the next weekday (`is_overnight_tail = true`). `24:00:00` (not `23:59:59`) is used specifically so the two rows are exactly adjacent with no gap and exact-duration math.
+Shifts that cross midnight (e.g. 22:00–06:00) are normalized at write time into two ordinary same-day rows: a **primary** row ending at `end_time = interval '24:00:00'` (end of day) on the starting weekday, and a **tail** row starting at `start_time = interval '0'` on the next weekday (`is_overnight_tail = true`). `24:00:00` (not `23:59:59`) is used specifically so the two rows are exactly adjacent with no gap and exact-duration math.
 
 Time-of-day is represented as Postgres `interval` (duration since midnight), not `time` (point-in-day) or a plain integer — this was a deliberate fix discovered during implementation planning. Postgres's `time` type does support a `24:00:00` boundary value, but Python's `datetime.time` cannot represent it at all (it caps at 23:59:59.999999), so a literal `24:00:00` wouldn't round-trip cleanly through the driver into application code. A plain integer (seconds-since-midnight) avoids that bug but loses SQL-level and in-memory readability (a bare `32400` means nothing without knowing the convention, versus `interval '09:00:00'` / `timedelta(hours=9)` which are self-evident and print naturally). `interval`/Python's `timedelta` avoids both problems at once: `timedelta` has no 24-hour ceiling (unlike `time`), so `24:00:00` round-trips with zero special-casing, while still being exact and human-readable in both SQL and Python. One implementation gotcha to note: Python's built-in `sum()` defaults to a `0` start value, and `0 + timedelta(...)` isn't defined — summing durations requires `sum(durations, start=timedelta())`.
 
@@ -118,14 +118,14 @@ CREATE TABLE schedule_weekday_hours (
   id                 bigserial PRIMARY KEY,
   schedule_id        bigint NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
   weekday            smallint NOT NULL CHECK (weekday BETWEEN 0 AND 6),  -- 0=Monday..6=Sunday (matches Python's datetime.weekday())
-  start_offset       interval NOT NULL,       -- duration since midnight, e.g. '22:00:00'
-  end_offset         interval NOT NULL,       -- duration since midnight, e.g. '24:00:00' for an overnight primary row
+  start_time       interval NOT NULL,       -- duration since midnight, e.g. '22:00:00'
+  end_time         interval NOT NULL,       -- duration since midnight, e.g. '24:00:00' for an overnight primary row
   is_overnight_tail  boolean NOT NULL DEFAULT false,
   deleted_at         timestamptz,             -- set only when the parent schedule is soft-deleted (cascade)
-  CHECK (start_offset >= interval '0' AND start_offset < interval '24:00:00'),
-  CHECK (end_offset > interval '0' AND end_offset <= interval '24:00:00'),
-  CHECK (end_offset > start_offset),
-  CHECK (NOT is_overnight_tail OR start_offset = interval '0')
+  CHECK (start_time >= interval '0' AND start_time < interval '24:00:00'),
+  CHECK (end_time > interval '0' AND end_time <= interval '24:00:00'),
+  CHECK (end_time > start_time),
+  CHECK (NOT is_overnight_tail OR start_time = interval '0')
 );
 CREATE UNIQUE INDEX schedule_weekday_hours_active_uniq
   ON schedule_weekday_hours (schedule_id, weekday, is_overnight_tail) WHERE deleted_at IS NULL;
