@@ -33,6 +33,7 @@ backend/
   app/
     main.py
     db.py
+    logging_config.py
     shared/
       pagination.py
     errors/
@@ -48,6 +49,7 @@ backend/
       schedule_agents/  model.py, queries.py
       reports/      model.py, queries.py
     services/
+      _conversions.py
       schedule_service.py
       assignment_service.py
       report_service.py
@@ -60,6 +62,7 @@ backend/
     seed_agents.py
   tests/
     conftest.py
+    test_logging_config.py, test_request_logging.py
     domain/       test_types.py, test_shift_normalization.py, test_overlap.py, test_business_hours.py
     components/   test_agents_queries.py, test_schedules_queries.py, test_schedule_agents_queries.py, test_reports_queries.py
     services/     test_schedule_service.py, test_assignment_service.py, test_report_service.py
@@ -70,15 +73,18 @@ The `backend/app/**/__init__.py` and `backend/tests/**/__init__.py` files alread
 
 ---
 
-### Task 1: Project setup — `uv`, dependencies, FastAPI skeleton, health check
+### Task 1: Project setup — `uv`, dependencies, FastAPI skeleton, health check, JSON logging
 
 **Files:**
 - Create: `backend/pyproject.toml`
+- Create: `backend/app/logging_config.py`
 - Modify: `backend/app/main.py`
-- Test: `backend/tests/test_health.py`
+- Test: `backend/tests/test_health.py`, `backend/tests/test_logging_config.py`
 
 **Interfaces:**
-- Produces: a runnable FastAPI app object `app` importable as `app.main:app`, with `GET /health` returning `{"status": "ok"}`.
+- Produces: a runnable FastAPI app object `app` importable as `app.main:app`, with `GET /health` returning `{"status": "ok"}`; `app.logging_config.JsonFormatter` (a `logging.Formatter` subclass emitting one JSON object per line, merging any `extra={...}` fields passed to a log call into the top-level JSON payload); `app.logging_config.configure_logging(level: int = logging.INFO) -> None`.
+
+Every later task that logs (schedule_service, assignment_service, report_service, the Task 16 request middleware) depends on this formatter's `extra`-merging behavior — a call like `logger.info("x", extra={"duration_ms": 12.3})` must produce `{"message": "x", "duration_ms": 12.3, ...}`, not bury `duration_ms` inside an unparsed string.
 
 - [ ] **Step 1: Initialize the `uv` project and add dependencies**
 
@@ -91,7 +97,7 @@ uv add --dev pytest httpx pytest-cov
 ```
 Expected: `pyproject.toml` is created/updated with these dependencies; `uv.lock` is generated.
 
-- [ ] **Step 2: Write the failing test**
+- [ ] **Step 2: Write the failing health-check test**
 
 ```python
 # backend/tests/test_health.py
@@ -105,16 +111,106 @@ def test_health_check_returns_ok():
     assert response.json() == {"status": "ok"}
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 3: Run test to verify it fails**
 
 Run: `cd ~/Desktop/Richpanel/backend && uv run pytest tests/test_health.py -v`
 Expected: FAIL — `ImportError: cannot import name 'app' from 'app.main'` (main.py is currently empty).
 
-- [ ] **Step 3: Write minimal implementation**
+- [ ] **Step 4: Write the failing JSON logging formatter test**
+
+```python
+# backend/tests/test_logging_config.py
+import json
+import logging
+import sys
+
+from app.logging_config import JsonFormatter
+
+
+def test_json_formatter_produces_valid_json_with_extra_fields():
+    formatter = JsonFormatter()
+    record = logging.LogRecord(
+        name="richpanel.test", level=logging.INFO, pathname=__file__, lineno=1,
+        msg="something happened", args=(), exc_info=None,
+    )
+    record.duration_ms = 42.5
+    record.schedule_id = 7
+
+    parsed = json.loads(formatter.format(record))
+
+    assert parsed["level"] == "INFO"
+    assert parsed["logger"] == "richpanel.test"
+    assert parsed["message"] == "something happened"
+    assert parsed["duration_ms"] == 42.5
+    assert parsed["schedule_id"] == 7
+    assert "timestamp" in parsed
+
+
+def test_json_formatter_includes_exception_info():
+    formatter = JsonFormatter()
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        record = logging.LogRecord(
+            name="richpanel.test", level=logging.ERROR, pathname=__file__, lineno=1,
+            msg="failed", args=(), exc_info=sys.exc_info(),
+        )
+    parsed = json.loads(formatter.format(record))
+    assert "ValueError: boom" in parsed["exc_info"]
+```
+
+- [ ] **Step 5: Run tests to verify they fail**
+
+Run: `cd ~/Desktop/Richpanel/backend && uv run pytest tests/test_logging_config.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'app.logging_config'`
+
+- [ ] **Step 6: Write the implementation**
+
+```python
+# backend/app/logging_config.py
+import json
+import logging
+
+_STANDARD_RECORD_ATTRS = set(
+    logging.LogRecord(name="", level=0, pathname="", lineno=0, msg="", args=(), exc_info=None).__dict__.keys()
+)
+
+
+class JsonFormatter(logging.Formatter):
+    """Emits one JSON object per log line. Any field passed via
+    logger.info(msg, extra={...}) is merged into the top-level payload, not
+    buried in an unparsed string -- this is what makes duration_ms,
+    schedule_id, agent_id etc. queryable in log tooling."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        extra = {k: v for k, v in record.__dict__.items() if k not in _STANDARD_RECORD_ATTRS}
+        payload.update(extra)
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str)
+
+
+def configure_logging(level: int = logging.INFO) -> None:
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonFormatter())
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(level)
+```
 
 ```python
 # backend/app/main.py
 from fastapi import FastAPI
+
+from app.logging_config import configure_logging
+
+configure_logging()
 
 app = FastAPI(title="Richpanel Schedule & Resolution Time Report")
 
@@ -124,15 +220,15 @@ def health_check() -> dict:
     return {"status": "ok"}
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [ ] **Step 7: Run all of this task's tests to verify they pass**
 
-Run: `cd ~/Desktop/Richpanel/backend && uv run pytest tests/test_health.py -v`
-Expected: PASS
+Run: `cd ~/Desktop/Richpanel/backend && uv run pytest tests/test_health.py tests/test_logging_config.py -v`
+Expected: PASS (3 passed)
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-cd ~/Desktop/Richpanel && git add backend/pyproject.toml backend/uv.lock backend/app/main.py backend/tests/test_health.py && git commit -m "feat: project setup with FastAPI skeleton and health check"
+cd ~/Desktop/Richpanel && git add backend/pyproject.toml backend/uv.lock backend/app/main.py backend/app/logging_config.py backend/tests/test_health.py backend/tests/test_logging_config.py && git commit -m "feat: project setup with FastAPI skeleton, health check, and JSON logging"
 ```
 
 ---
@@ -457,23 +553,28 @@ from sqlalchemy import text
 from app.db import db_session_read, db_session_write
 
 
-def test_write_session_commits_on_clean_exit():
+def test_write_session_commits_on_clean_exit(db):
     with db_session_write() as session:
-        session.execute(text("CREATE TEMP TABLE IF NOT EXISTS _probe (id int)"))
-        session.execute(text("INSERT INTO _probe VALUES (1)"))
-    # a fresh session on the same connection pool won't see the temp table
-    # (temp tables are connection-scoped), so instead assert no exception
-    # propagated and the context manager completed — the real commit
-    # behavior is exercised end-to-end in later component tests.
+        session.execute(text("INSERT INTO agents (name) VALUES ('probe-commit-test')"))
+
+    with db_session_read() as read_session:
+        count = read_session.execute(
+            text("SELECT COUNT(*) FROM agents WHERE name = 'probe-commit-test'")
+        ).scalar()
+    assert count == 1
 
 
-def test_write_session_rolls_back_on_exception():
+def test_write_session_rolls_back_on_exception(db):
     with pytest.raises(ValueError):
         with db_session_write() as session:
-            session.execute(text("SELECT 1"))
+            session.execute(text("INSERT INTO agents (name) VALUES ('probe-rollback-test')"))
             raise ValueError("boom")
-    # no assertion needed beyond "the exception propagated" — rollback behavior
-    # is exercised meaningfully once real writes exist, in later tasks.
+
+    with db_session_read() as read_session:
+        count = read_session.execute(
+            text("SELECT COUNT(*) FROM agents WHERE name = 'probe-rollback-test'")
+        ).scalar()
+    assert count == 0
 
 
 def test_read_session_has_no_commit_side_effect(db):
@@ -2143,10 +2244,33 @@ def test_list_schedules_returns_created_schedules(db):
 Run: `cd ~/Desktop/Richpanel/backend && uv run pytest tests/services/test_schedule_service.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'app.services.schedule_service'`
 
-- [ ] **Step 3: Write the implementation**
+- [ ] **Step 3: Write the shared ORM-row-to-domain-type conversion helper**
+
+`schedule_service`, `assignment_service`, and `report_service` all need to convert a `ScheduleWeekdayHours` ORM row into a domain `WeekdayShift`. Writing that conversion once here, rather than inline in each service, is what keeps it from drifting into three slightly-different copies as later tasks are added.
+
+```python
+# backend/app/services/_conversions.py
+from app.domain.types import WeekdayShift
+
+
+def weekday_shift_from_row(row) -> WeekdayShift:
+    """Convert a ScheduleWeekdayHours ORM row into a domain WeekdayShift.
+    The one place this conversion is written -- every service imports this
+    rather than reconstructing it inline."""
+    return WeekdayShift(
+        weekday=row.weekday,
+        start_time=row.start_time,
+        end_time=row.end_time,
+        is_overnight_tail=row.is_overnight_tail,
+    )
+```
+
+- [ ] **Step 4: Write the implementation**
 
 ```python
 # backend/app/services/schedule_service.py
+import logging
+import time
 from dataclasses import dataclass
 from datetime import date
 
@@ -2156,6 +2280,9 @@ from app.domain.overlap import find_self_overlaps
 from app.domain.shift_normalization import normalize_shift, recombine_shifts
 from app.domain.types import ShiftInput
 from app.errors.error import NotFoundError, ScheduleOverlapError
+from app.services._conversions import weekday_shift_from_row
+
+logger = logging.getLogger("richpanel.schedule_service")
 
 
 @dataclass(frozen=True)
@@ -2168,12 +2295,7 @@ class ScheduleDetail:
 
 
 def _to_detail(schedule, weekday_hours_rows) -> ScheduleDetail:
-    normalized = [
-        __import__("app.domain.types", fromlist=["WeekdayShift"]).WeekdayShift(
-            weekday=r.weekday, start_time=r.start_time, end_time=r.end_time, is_overnight_tail=r.is_overnight_tail
-        )
-        for r in weekday_hours_rows
-    ]
+    normalized = [weekday_shift_from_row(r) for r in weekday_hours_rows]
     return ScheduleDetail(
         id=schedule.id,
         name=schedule.name,
@@ -2186,6 +2308,7 @@ def _to_detail(schedule, weekday_hours_rows) -> ScheduleDetail:
 def create_schedule(
     name: str, start_date: date, end_date: date | None, shift_inputs: list[ShiftInput]
 ) -> ScheduleDetail:
+    started = time.perf_counter()
     normalized_shifts = [ws for shift in shift_inputs for ws in normalize_shift(shift)]
 
     conflicts = find_self_overlaps(normalized_shifts)
@@ -2196,85 +2319,13 @@ def create_schedule(
         schedule = schedules_queries.create_schedule(session, name=name, start_date=start_date, end_date=end_date)
         schedules_queries.insert_weekday_hours_rows(session, schedule.id, normalized_shifts)
         rows = schedules_queries.get_weekday_hours_rows(session, schedule.id)
-        return _to_detail(schedule, rows)
+        detail = _to_detail(schedule, rows)
 
-
-def get_schedule_detail(schedule_id: int) -> ScheduleDetail:
-    with db_session_read() as session:
-        schedule = schedules_queries.get_schedule(session, schedule_id)
-        if schedule is None:
-            raise NotFoundError(f"schedule {schedule_id} not found")
-        rows = schedules_queries.get_weekday_hours_rows(session, schedule_id)
-        return _to_detail(schedule, rows)
-
-
-def list_schedules(limit: int, offset: int) -> list[ScheduleDetail]:
-    with db_session_read() as session:
-        schedules = schedules_queries.list_active_schedules(session, limit, offset)
-        return [
-            _to_detail(s, schedules_queries.get_weekday_hours_rows(session, s.id)) for s in schedules
-        ]
-```
-
-Note the `__import__` in `_to_detail` — that's a placeholder-style hack and violates "no placeholders." Replace it with a direct import.
-
-- [ ] **Step 3 (corrected): Write the implementation with a clean import**
-
-```python
-# backend/app/services/schedule_service.py
-from dataclasses import dataclass
-from datetime import date
-
-from app.components.schedules import queries as schedules_queries
-from app.db import db_session_read, db_session_write
-from app.domain.overlap import find_self_overlaps
-from app.domain.shift_normalization import normalize_shift, recombine_shifts
-from app.domain.types import ShiftInput, WeekdayShift
-from app.errors.error import NotFoundError, ScheduleOverlapError
-
-
-@dataclass(frozen=True)
-class ScheduleDetail:
-    id: int
-    name: str
-    start_date: date
-    end_date: date | None
-    shifts: list[ShiftInput]
-
-
-def _to_detail(schedule, weekday_hours_rows) -> ScheduleDetail:
-    normalized = [
-        WeekdayShift(
-            weekday=r.weekday,
-            start_time=r.start_time,
-            end_time=r.end_time,
-            is_overnight_tail=r.is_overnight_tail,
-        )
-        for r in weekday_hours_rows
-    ]
-    return ScheduleDetail(
-        id=schedule.id,
-        name=schedule.name,
-        start_date=schedule.start_date,
-        end_date=schedule.end_date,
-        shifts=recombine_shifts(normalized),
+    logger.info(
+        "schedule created",
+        extra={"schedule_id": detail.id, "shift_count": len(normalized_shifts), "duration_ms": round((time.perf_counter() - started) * 1000, 2)},
     )
-
-
-def create_schedule(
-    name: str, start_date: date, end_date: date | None, shift_inputs: list[ShiftInput]
-) -> ScheduleDetail:
-    normalized_shifts = [ws for shift in shift_inputs for ws in normalize_shift(shift)]
-
-    conflicts = find_self_overlaps(normalized_shifts)
-    if conflicts:
-        raise ScheduleOverlapError(conflicts)
-
-    with db_session_write() as session:
-        schedule = schedules_queries.create_schedule(session, name=name, start_date=start_date, end_date=end_date)
-        schedules_queries.insert_weekday_hours_rows(session, schedule.id, normalized_shifts)
-        rows = schedules_queries.get_weekday_hours_rows(session, schedule.id)
-        return _to_detail(schedule, rows)
+    return detail
 
 
 def get_schedule_detail(schedule_id: int) -> ScheduleDetail:
@@ -2292,15 +2343,17 @@ def list_schedules(limit: int, offset: int) -> list[ScheduleDetail]:
         return [_to_detail(s, schedules_queries.get_weekday_hours_rows(session, s.id)) for s in schedules]
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+Note the logging call here: it uses `extra={...}` rather than string-formatting the values into the message. That's deliberate — Task 16 configures a JSON formatter that reads fields out of `extra` and emits them as top-level JSON keys (`schedule_id`, `shift_count`, `duration_ms`), so this line ends up queryable in log tooling rather than buried in free text. Every later task's logging follows this same `extra={...}` convention.
+
+- [ ] **Step 5: Run tests to verify they pass**
 
 Run: `cd ~/Desktop/Richpanel/backend && uv run pytest tests/services/test_schedule_service.py -v`
 Expected: PASS (5 passed)
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-cd ~/Desktop/Richpanel && git add backend/app/services/schedule_service.py backend/tests/services/test_schedule_service.py && git commit -m "feat: schedule_service create/get/list with self-overlap validation"
+cd ~/Desktop/Richpanel && git add backend/app/services/schedule_service.py backend/app/services/_conversions.py backend/tests/services/test_schedule_service.py && git commit -m "feat: schedule_service create/get/list with self-overlap validation"
 ```
 
 ---
@@ -2416,20 +2469,31 @@ Expected: FAIL — `ImportError: cannot import name 'update_schedule_hours' from
 
 - [ ] **Step 3: Extend the implementation**
 
-Add to `backend/app/services/schedule_service.py`:
+Replace the top of `backend/app/services/schedule_service.py` (the import block) with:
 
 ```python
-# add these imports at the top
-from app.components.agents.queries import get_agent
-from app.components.schedule_agents import queries as schedule_agents_queries
-from app.db import engine  # for the sorted-agent-id advisory lock loop
-from app.domain.overlap import find_overlaps
-from app.errors.error import AssignmentOverlapError
+import logging
+import time
+from dataclasses import dataclass
+from datetime import date
+
 from sqlalchemy import text
 
+from app.components.schedule_agents import queries as schedule_agents_queries
+from app.components.schedules import queries as schedules_queries
+from app.db import db_session_read, db_session_write
+from app.domain.overlap import find_overlaps, find_self_overlaps
+from app.domain.shift_normalization import normalize_shift, recombine_shifts
+from app.domain.types import ShiftInput
+from app.errors.error import AssignmentOverlapError, NotFoundError, ScheduleOverlapError
+from app.services._conversions import weekday_shift_from_row
 
-# add these functions at the end of the file
+logger = logging.getLogger("richpanel.schedule_service")
+```
 
+Then add these functions at the end of the file:
+
+```python
 @dataclass(frozen=True)
 class DeletionImpact:
     schedule_id: int
@@ -2449,32 +2513,38 @@ def update_schedule_hours(schedule_id: int, shift_inputs: list[ShiftInput]) -> S
             raise NotFoundError(f"schedule {schedule_id} not found")
 
         assignee_ids = sorted(schedule_agents_queries.list_active_assignee_agent_ids(session, schedule_id))
+
+        lock_started = time.perf_counter()
         for agent_id in assignee_ids:
             session.execute(text("SELECT pg_advisory_xact_lock(:aid)"), {"aid": agent_id})
+        lock_wait_ms = round((time.perf_counter() - lock_started) * 1000, 2)
 
         for agent_id in assignee_ids:
             other_schedule_ids = schedule_agents_queries.get_other_active_schedule_ids_for_agent(
                 session, agent_id, exclude_schedule_id=schedule_id
             )
-            existing_shifts: list[WeekdayShift] = []
-            for other_id in other_schedule_ids:
-                rows = schedules_queries.get_weekday_hours_rows(session, other_id)
-                existing_shifts.extend(
-                    WeekdayShift(
-                        weekday=r.weekday,
-                        start_time=r.start_time,
-                        end_time=r.end_time,
-                        is_overnight_tail=r.is_overnight_tail,
-                    )
-                    for r in rows
-                )
+            existing_shifts = [
+                weekday_shift_from_row(r)
+                for other_id in other_schedule_ids
+                for r in schedules_queries.get_weekday_hours_rows(session, other_id)
+            ]
             conflicts = find_overlaps(existing_shifts, normalized_shifts)
             if conflicts:
+                logger.info(
+                    "schedule edit rejected: assignment overlap",
+                    extra={"schedule_id": schedule_id, "agent_id": agent_id, "lock_wait_ms": lock_wait_ms},
+                )
                 raise AssignmentOverlapError(agent_id=agent_id, conflicts=conflicts)
 
         schedules_queries.replace_weekday_hours_rows(session, schedule_id, normalized_shifts)
         rows = schedules_queries.get_weekday_hours_rows(session, schedule_id)
-        return _to_detail(schedule, rows)
+        detail = _to_detail(schedule, rows)
+
+    logger.info(
+        "schedule hours updated",
+        extra={"schedule_id": schedule_id, "assignee_count": len(assignee_ids), "lock_wait_ms": lock_wait_ms},
+    )
+    return detail
 
 
 def get_deletion_impact(schedule_id: int) -> DeletionImpact:
@@ -2494,42 +2564,10 @@ def soft_delete_schedule(schedule_id: int) -> None:
         schedules_queries.soft_delete_schedule(session, schedule_id)
         schedule_agents_queries.soft_delete_assignments_for_schedule(session, schedule_id)
         schedules_queries.soft_delete_weekday_hours_for_schedule(session, schedule_id)
+    logger.info("schedule soft-deleted", extra={"schedule_id": schedule_id})
 ```
 
-Remove the unused `from app.db import engine` import — it isn't used (the advisory lock goes through `session.execute`, not the raw engine). Final imports block for the file:
-
-```python
-from dataclasses import dataclass
-from datetime import date
-
-from sqlalchemy import text
-
-from app.components.agents.queries import get_agent
-from app.components.schedule_agents import queries as schedule_agents_queries
-from app.components.schedules import queries as schedules_queries
-from app.db import db_session_read, db_session_write
-from app.domain.overlap import find_overlaps, find_self_overlaps
-from app.domain.shift_normalization import normalize_shift, recombine_shifts
-from app.domain.types import ShiftInput, WeekdayShift
-from app.errors.error import AssignmentOverlapError, NotFoundError, ScheduleOverlapError
-```
-
-`get_agent` is imported but unused in this task — remove it too; it isn't needed until Task 14. Final clean imports:
-
-```python
-from dataclasses import dataclass
-from datetime import date
-
-from sqlalchemy import text
-
-from app.components.schedule_agents import queries as schedule_agents_queries
-from app.components.schedules import queries as schedules_queries
-from app.db import db_session_read, db_session_write
-from app.domain.overlap import find_overlaps, find_self_overlaps
-from app.domain.shift_normalization import normalize_shift, recombine_shifts
-from app.domain.types import ShiftInput, WeekdayShift
-from app.errors.error import AssignmentOverlapError, NotFoundError, ScheduleOverlapError
-```
+Note `lock_wait_ms` measures the time spent acquiring every assignee's advisory lock before any conflict-checking begins — a slow or contended lock is exactly the kind of thing worth being able to see in logs later, since the whole overlap-prevention design depends on that lock never becoming a bottleneck.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -2659,32 +2697,34 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'app.services.assignmen
 
 ```python
 # backend/app/services/assignment_service.py
+import logging
+import time
+
 from sqlalchemy import text
 
 from app.components.agents.model import Agent
-from app.components.agents.queries import get_agent, list_agents
+from app.components.agents.queries import get_agent
 from app.components.schedule_agents import queries as schedule_agents_queries
 from app.components.schedules import queries as schedules_queries
 from app.db import db_session_read, db_session_write
 from app.domain.overlap import find_overlaps
 from app.domain.types import WeekdayShift
 from app.errors.error import AssignmentOverlapError, NotFoundError
+from app.services._conversions import weekday_shift_from_row
+
+logger = logging.getLogger("richpanel.assignment_service")
 
 
 def _weekday_shifts_for_schedule(session, schedule_id: int) -> list[WeekdayShift]:
-    rows = schedules_queries.get_weekday_hours_rows(session, schedule_id)
-    return [
-        WeekdayShift(
-            weekday=r.weekday, start_time=r.start_time, end_time=r.end_time, is_overnight_tail=r.is_overnight_tail
-        )
-        for r in rows
-    ]
+    return [weekday_shift_from_row(r) for r in schedules_queries.get_weekday_hours_rows(session, schedule_id)]
 
 
 def assign_agent(schedule_id: int, agent_id: int) -> None:
     with db_session_write() as session:
         # check-then-write must share this one locked transaction (see Global Constraints)
+        lock_started = time.perf_counter()
         session.execute(text("SELECT pg_advisory_xact_lock(:aid)"), {"aid": agent_id})
+        lock_wait_ms = round((time.perf_counter() - lock_started) * 1000, 2)
 
         schedule = schedules_queries.get_schedule(session, schedule_id)
         if schedule is None:
@@ -2698,14 +2738,23 @@ def assign_agent(schedule_id: int, agent_id: int) -> None:
         new_shifts = _weekday_shifts_for_schedule(session, schedule_id)
         conflicts = find_overlaps(existing_shifts, new_shifts)
         if conflicts:
+            logger.info(
+                "assignment rejected: overlap",
+                extra={"schedule_id": schedule_id, "agent_id": agent_id, "lock_wait_ms": lock_wait_ms},
+            )
             raise AssignmentOverlapError(agent_id=agent_id, conflicts=conflicts)
 
         schedule_agents_queries.create_assignment(session, schedule_id, agent_id)
+
+    logger.info(
+        "agent assigned", extra={"schedule_id": schedule_id, "agent_id": agent_id, "lock_wait_ms": lock_wait_ms}
+    )
 
 
 def unassign_agent(schedule_id: int, agent_id: int) -> None:
     with db_session_write() as session:
         schedule_agents_queries.soft_delete_assignment(session, schedule_id, agent_id)
+    logger.info("agent unassigned", extra={"schedule_id": schedule_id, "agent_id": agent_id})
 
 
 def list_assignees(schedule_id: int) -> list[Agent]:
@@ -2823,6 +2872,20 @@ def test_list_reports_returns_summaries(db):
     result = list_reports(limit=10, offset=0)
 
     assert len(result) == 1
+
+
+def test_generate_report_logs_phase_durations(db, caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="richpanel.report_service"):
+        generate_report(ticket_start_at=datetime(2026, 1, 6, 10, 0, 0), ticket_end_at=datetime(2026, 1, 6, 14, 0, 0))
+
+    records = [r for r in caplog.records if r.name == "richpanel.report_service"]
+    assert len(records) == 1
+    assert hasattr(records[0], "read_ms")
+    assert hasattr(records[0], "compute_ms")
+    assert hasattr(records[0], "write_ms")
+    assert hasattr(records[0], "agent_count")
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -2834,6 +2897,8 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'app.services.report_se
 
 ```python
 # backend/app/services/report_service.py
+import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -2842,6 +2907,9 @@ from app.db import db_session_read, db_session_write
 from app.domain.business_hours import calculate_business_seconds
 from app.domain.types import WeekdayShift
 from app.errors.error import NotFoundError
+from app.services._conversions import weekday_shift_from_row
+
+logger = logging.getLogger("richpanel.report_service")
 
 
 @dataclass(frozen=True)
@@ -2863,20 +2931,17 @@ def generate_report(ticket_start_at: datetime, ticket_end_at: datetime) -> Repor
         raise ValueError("ticket_end_at must be after ticket_start_at")
 
     # 1. Read: fetch the bounded row set, then release the connection.
+    read_started = time.perf_counter()
     with db_session_read() as session:
         pairs = reports_queries.get_active_agent_schedule_pairs(session, ticket_start_at, ticket_end_at)
         schedule_ids = sorted({sid for _, sid in pairs if sid is not None})
         weekday_hours_by_schedule = reports_queries.get_weekday_hours_for_schedules(session, schedule_ids)
+    read_ms = round((time.perf_counter() - read_started) * 1000, 2)
 
     # 2. Compute: pure in-memory work, no DB connection held during this.
+    compute_started = time.perf_counter()
     weekly_shifts_by_schedule: dict[int, list[WeekdayShift]] = {
-        sid: [
-            WeekdayShift(
-                weekday=r.weekday, start_time=r.start_time, end_time=r.end_time, is_overnight_tail=r.is_overnight_tail
-            )
-            for r in rows
-        ]
-        for sid, rows in weekday_hours_by_schedule.items()
+        sid: [weekday_shift_from_row(r) for r in rows] for sid, rows in weekday_hours_by_schedule.items()
     }
 
     totals_by_agent: dict[int, int] = {}
@@ -2886,12 +2951,27 @@ def generate_report(ticket_start_at: datetime, ticket_end_at: datetime) -> Repor
             continue
         shifts = weekly_shifts_by_schedule.get(schedule_id, [])
         totals_by_agent[agent_id] += calculate_business_seconds(shifts, ticket_start_at, ticket_end_at)
+    compute_ms = round((time.perf_counter() - compute_started) * 1000, 2)
 
     # 3. Write: fresh session, only to persist the already-computed result.
+    write_started = time.perf_counter()
     with db_session_write() as session:
         report = reports_queries.create_report(session, ticket_start_at, ticket_end_at)
         reports_queries.insert_agent_hours(session, report.id, list(totals_by_agent.items()))
         report_id = report.id
+    write_ms = round((time.perf_counter() - write_started) * 1000, 2)
+
+    logger.info(
+        "report generated",
+        extra={
+            "report_id": report_id,
+            "agent_count": len(totals_by_agent),
+            "schedule_count": len(schedule_ids),
+            "read_ms": read_ms,
+            "compute_ms": compute_ms,
+            "write_ms": write_ms,
+        },
+    )
 
     return ReportResult(
         id=report_id,
@@ -2929,7 +3009,7 @@ def list_reports(limit: int, offset: int) -> list[ReportResult]:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd ~/Desktop/Richpanel/backend && uv run pytest tests/services/test_report_service.py -v`
-Expected: PASS (6 passed)
+Expected: PASS (7 passed)
 
 - [ ] **Step 5: Commit**
 
@@ -2939,18 +3019,18 @@ cd ~/Desktop/Richpanel && git add backend/app/services/report_service.py backend
 
 ---
 
-### Task 16: `shared/pagination.py` and global exception handling wired into `main.py`
+### Task 16: `shared/pagination.py`, global exception handling, and request-timing middleware in `main.py`
 
 **Files:**
 - Create: `backend/app/shared/pagination.py`
 - Create: `backend/app/shared/__init__.py`
 - Modify: `backend/app/main.py`
-- Test: `backend/tests/test_exception_handlers.py`
+- Test: `backend/tests/test_exception_handlers.py`, `backend/tests/test_request_logging.py`
 
 **Interfaces:**
-- Produces: `PaginationParams` (Pydantic model with `limit: int = 50`, `offset: int = 0`, both validated `>= 0`, `limit <= 200`) as a FastAPI dependency; exception handlers on `app` mapping `NotFoundError` → 404, `ConflictError` → 409, `DomainValidationError` → 400, and any other `Exception` → 500 with no internal detail leaked.
+- Produces: `PaginationParams` (Pydantic model with `limit: int = 50`, `offset: int = 0`, both validated `>= 0`, `limit <= 200`) as a FastAPI dependency; `register_exception_handlers(app: FastAPI) -> None` mapping `NotFoundError` → 404, `ConflictError` → 409, `DomainValidationError` → 400, and any other `Exception` → 500 with no internal detail leaked; `register_request_logging(app: FastAPI) -> None` — middleware logging every request's method/path/status/duration_ms as one structured JSON line via the Task 1 `JsonFormatter`.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing exception-handler test**
 
 ```python
 # backend/tests/test_exception_handlers.py
@@ -3010,12 +3090,50 @@ def test_unexpected_error_maps_to_500_without_leaking_detail():
     assert "internal secret detail" not in response.text
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Write the failing request-logging middleware test**
 
-Run: `cd ~/Desktop/Richpanel/backend && uv run pytest tests/test_exception_handlers.py -v`
-Expected: FAIL — `ImportError: cannot import name 'register_exception_handlers' from 'app.main'`
+```python
+# backend/tests/test_request_logging.py
+import logging
 
-- [ ] **Step 3: Write `shared/pagination.py`**
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from app.main import register_request_logging
+
+
+def _build_test_app() -> FastAPI:
+    app = FastAPI()
+    register_request_logging(app)
+
+    @app.get("/ping")
+    def ping():
+        return {"pong": True}
+
+    return app
+
+
+def test_request_logging_records_method_path_status_and_duration(caplog):
+    client = TestClient(_build_test_app())
+
+    with caplog.at_level(logging.INFO, logger="richpanel.request"):
+        response = client.get("/ping")
+
+    assert response.status_code == 200
+    records = [r for r in caplog.records if r.name == "richpanel.request"]
+    assert len(records) == 1
+    assert records[0].method == "GET"
+    assert records[0].path == "/ping"
+    assert records[0].status_code == 200
+    assert isinstance(records[0].duration_ms, float)
+```
+
+- [ ] **Step 3: Run tests to verify they fail**
+
+Run: `cd ~/Desktop/Richpanel/backend && uv run pytest tests/test_exception_handlers.py tests/test_request_logging.py -v`
+Expected: FAIL — `ImportError: cannot import name 'register_exception_handlers' from 'app.main'` (neither function exists yet)
+
+- [ ] **Step 4: Write `shared/pagination.py`**
 
 ```python
 # backend/app/shared/pagination.py
@@ -3027,18 +3145,25 @@ class PaginationParams(BaseModel):
     offset: int = Field(default=0, ge=0)
 ```
 
-- [ ] **Step 4: Extend `main.py` with exception handler registration**
+- [ ] **Step 5: Extend `main.py` with exception handlers and request-timing middleware**
+
+This builds on Task 1's `main.py` (which already calls `configure_logging()` before the app is constructed) — that call stays; this step adds to the same file rather than replacing it.
 
 ```python
 # backend/app/main.py
 import logging
+import time
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.errors.error import AppError, ConflictError, DomainValidationError, NotFoundError
+from app.logging_config import configure_logging
+
+configure_logging()
 
 logger = logging.getLogger("richpanel")
+request_logger = logging.getLogger("richpanel.request")
 
 STATUS_BY_ERROR_TYPE = [
     (NotFoundError, 404, "not_found"),
@@ -3060,12 +3185,35 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def _unhandled_exception_handler(request: Request, exc: Exception):
-        logger.exception("unhandled exception on %s %s", request.method, request.url.path)
+        logger.error(
+            "unhandled exception",
+            extra={"method": request.method, "path": request.url.path},
+            exc_info=exc,
+        )
         return JSONResponse(status_code=500, content={"error_code": "internal_error", "message": "internal server error"})
+
+
+def register_request_logging(app: FastAPI) -> None:
+    @app.middleware("http")
+    async def _log_requests(request: Request, call_next):
+        started = time.perf_counter()
+        response = await call_next(request)
+        duration_ms = round((time.perf_counter() - started) * 1000, 2)
+        request_logger.info(
+            "request handled",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "duration_ms": duration_ms,
+            },
+        )
+        return response
 
 
 app = FastAPI(title="Richpanel Schedule & Resolution Time Report")
 register_exception_handlers(app)
+register_request_logging(app)
 
 
 @app.get("/health")
@@ -3073,15 +3221,15 @@ def health_check() -> dict:
     return {"status": "ok"}
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [ ] **Step 6: Run tests to verify they pass**
 
-Run: `cd ~/Desktop/Richpanel/backend && uv run pytest tests/test_exception_handlers.py tests/test_health.py -v`
-Expected: PASS (5 passed)
+Run: `cd ~/Desktop/Richpanel/backend && uv run pytest tests/test_exception_handlers.py tests/test_request_logging.py tests/test_health.py -v`
+Expected: PASS (6 passed)
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-cd ~/Desktop/Richpanel && git add backend/app/shared/ backend/app/main.py backend/tests/test_exception_handlers.py && git commit -m "feat: shared pagination params + global exception handlers"
+cd ~/Desktop/Richpanel && git add backend/app/shared/ backend/app/main.py backend/tests/test_exception_handlers.py backend/tests/test_request_logging.py && git commit -m "feat: shared pagination params, global exception handlers, request-timing middleware"
 ```
 
 ---
@@ -3976,10 +4124,15 @@ cd ~/Desktop/Richpanel && git add backend/tests/test_full_suite_smoke.py backend
 
 ## Self-Review Notes
 
-**Spec coverage:** FR1 (schedule CRUD) — Tasks 9, 12, 13, 18. FR2 (assignment, non-overlap) — Tasks 5, 10, 14, 19, 21 (concurrency). FR3 (business hours computation) — Tasks 3-6, 15. FR4 (persist + browsable history) — Tasks 11, 15, 20. NFR efficiency (business hours) — Task 6, validated against spec Appendix A numbers in Task 6's tests. NFR efficiency (overlap prevention) — Task 14/21 (advisory lock + concurrency proof). Soft delete (spec §4.6) — Tasks 9, 10, 13. Deletion preview (spec §4.7) — Task 13, 18. Edit re-validation without redundant checks (spec §4.8) — Task 13. Read/write session separation (this conversation's addition) — Task 2 (the contract), Task 15 (the concrete read→compute→write example), documented as an explicit exception at the advisory-lock call sites in Tasks 13/14.
+**Spec coverage:** FR1 (schedule CRUD) — Tasks 9, 12, 13, 18. FR2 (assignment, non-overlap) — Tasks 5, 10, 14, 19, 21 (concurrency). FR3 (business hours computation) — Tasks 3-6, 15. FR4 (persist + browsable history) — Tasks 11, 15, 20. NFR efficiency (business hours) — Task 6, validated against spec Appendix A numbers in Task 6's tests. NFR efficiency (overlap prevention) — Task 14/21 (advisory lock + concurrency proof). Soft delete (spec §4.6) — Tasks 9, 10, 13. Deletion preview (spec §4.7) — Task 13, 18. Edit re-validation without redundant checks (spec §4.8) — Task 13. Read/write session separation — Task 2 (the contract), Task 15 (the concrete read→compute→write example), documented as an explicit exception at the advisory-lock call sites in Tasks 13/14. Structured JSON logging with timing — Task 1 (the `JsonFormatter`/`configure_logging` foundation), Task 16 (per-request method/path/status/duration_ms middleware), Tasks 12/13/14/15 (operation-specific timing: schedule create/update, lock-wait duration, report read/compute/write phase durations).
 
-**Placeholder scan:** the one instance of a placeholder-style `__import__` hack in Task 12's first draft was caught and replaced with a clean import in the same task, per "No Placeholders."
+**Pre-flight review (run before Task 1 was dispatched, per this skill's process):** found and fixed three real defects rather than letting them surface as task-reviewer bounces later —
+1. Tasks 12 and 13 each originally contained a flawed draft implementation immediately followed by a "(corrected)" replacement of the same step — confusing for an implementer subagent (which version governs?). Both are now single, clean steps with no leftover draft artifacts.
+2. `ScheduleWeekdayHours` row → `WeekdayShift` conversion was duplicated near-verbatim across `schedule_service.py`, `assignment_service.py`, and `report_service.py` (Tasks 12/13, 14, 15). Extracted into one shared `services/_conversions.py::weekday_shift_from_row`, added in Task 12 and imported by the other three — this is exactly the kind of duplication the review rubric flags, cheaper to fix once here than three times across separate task reviews.
+3. Task 2's two `db_session_write` contract tests originally asserted nothing (a comment explained the real behavior was "tested later") — replaced with real assertions: insert a row inside the session, then check its presence/absence from a separate `db_session_read` afterward, which actually proves commit-on-clean-exit and rollback-on-exception rather than just "no exception was raised."
 
-**Type consistency check:** `WeekdayShift`/`ShiftInput` field names (`weekday`, `start_time`, `end_time`, `is_overnight_tail`) are identical across Tasks 3-15 and the ORM column names (`weekday`, `start_time`, `end_time`, `is_overnight_tail`) in Task 9 — no renaming drift. `db_session_read`/`db_session_write` (Task 2) are used with those exact names in every later task, never a different spelling. Error class names (`NotFoundError`, `ConflictError`, `ScheduleOverlapError`, `AssignmentOverlapError`, `DomainValidationError`) match between Task 7's definitions and every later `raise`/`except`/`pytest.raises` usage.
+**Placeholder scan:** clean — the `__import__` hack that was in Task 12's original draft is gone entirely (not just replaced downstream) after the pre-flight fix above.
+
+**Type consistency check:** `WeekdayShift`/`ShiftInput` field names (`weekday`, `start_time`, `end_time`, `is_overnight_tail`) are identical across Tasks 3-15 and the ORM column names (`weekday`, `start_time`, `end_time`, `is_overnight_tail`) in Task 9 — no renaming drift. `db_session_read`/`db_session_write` (Task 2) are used with those exact names in every later task, never a different spelling. Error class names (`NotFoundError`, `ConflictError`, `ScheduleOverlapError`, `AssignmentOverlapError`, `DomainValidationError`) match between Task 7's definitions and every later `raise`/`except`/`pytest.raises` usage. Logger names follow one convention throughout: `richpanel.<module>` (`richpanel.schedule_service`, `richpanel.assignment_service`, `richpanel.report_service`, `richpanel.request`), and every structured field is passed via `extra={...}`, never string-interpolated into the message — consistent with what Task 1's `JsonFormatter` test asserts.
 
 **Not covered by this plan (explicitly deferred, per spec §10 and the frontend split):** the Next.js frontend, and the spec's still-open items (concrete timezone value, weekday-numbering confirmation with stakeholders) — both should be resolved before or during frontend work, not blocking this backend plan.
