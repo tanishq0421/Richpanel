@@ -1,11 +1,22 @@
 # backend/app/components/schedules/queries.py
 from datetime import date, datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.orm import Session
 
 from app.components.schedules.model import Schedule, ScheduleWeekdayHours
 from app.domain.types import IST, WeekdayShift
+
+# Postgres keeps single-key and key-pair advisory locks in two separate spaces,
+# so pg_advisory_xact_lock(SCHEDULE_LOCK_NAMESPACE, schedule_id) can never
+# collide with the single-key pg_advisory_xact_lock(agent_id) taken by
+# agents.queries.lock_agent -- even when a schedule id equals an agent id. The
+# one-argument form must NEVER be used for schedule ids for exactly that reason.
+SCHEDULE_LOCK_NAMESPACE = 1
+
+# The GLOBAL lock order, which every writer must follow or two writers can
+# deadlock: the schedule lock first, then that schedule's agent locks in
+# ascending agent_id order.
 
 
 def create_schedule(session: Session, name: str, start_date: date, end_date: date | None) -> Schedule:
@@ -25,6 +36,25 @@ def list_active_schedules(session: Session, limit: int, offset: int) -> list[Sch
     return list(session.scalars(stmt))
 
 
+def lock_schedule(session: Session, schedule_id: int) -> None:
+    """Serialise every writer touching this schedule, held to end of transaction.
+
+    Locking the agents alone is not enough. An hours edit locks the agents
+    ASSIGNED TO the schedule, so a schedule with no assignees locked nothing --
+    and a concurrent assign_agent, which also locked only the agent, had nothing
+    to contend on. The two transactions then validated against each other's
+    stale state and both committed, leaving the agent on two schedules whose
+    hours overlap. This lock is the thing they now contend on.
+
+    Callers MUST take this before any agent lock (see SCHEDULE_LOCK_NAMESPACE),
+    and MUST re-read the assignee list after taking it -- a list read beforehand
+    is exactly the stale input this lock exists to prevent."""
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(:ns, :schedule_id)"),
+        {"ns": SCHEDULE_LOCK_NAMESPACE, "schedule_id": schedule_id},
+    )
+
+
 def touch_schedule(session: Session, schedule_id: int) -> None:
     """Bump updated_at on the schedule itself.
 
@@ -33,6 +63,21 @@ def touch_schedule(session: Session, schedule_id: int) -> None:
     the column's onupdate can never fire, and 'last modified' would stay at the
     creation time no matter how often the hours changed."""
     session.execute(update(Schedule).where(Schedule.id == schedule_id).values(updated_at=datetime.now(IST)))
+
+
+def update_schedule_attributes(session: Session, schedule: Schedule, values: dict[str, object]) -> None:
+    """Apply schedule-level edits (name / start_date / end_date) to an
+    already-loaded row.
+
+    Assigning through the ORM rather than emitting a Core update() keeps the
+    in-memory object in step with the row, so the caller can build its response
+    straight from it; a Core UPDATE would leave `schedule` holding the pre-edit
+    values and the API would echo back what the client just replaced. The flush
+    fires the model's onupdate, which is why this needs no touch_schedule()
+    alongside it -- that would be a second, redundant write."""
+    for field, value in values.items():
+        setattr(schedule, field, value)
+    session.flush()
 
 
 def soft_delete_schedule(session: Session, schedule_id: int) -> None:

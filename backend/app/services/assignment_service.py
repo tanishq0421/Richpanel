@@ -3,8 +3,7 @@ import logging
 import time
 from dataclasses import dataclass
 
-from sqlalchemy import text
-
+from app.components.agents import queries as agents_queries
 from app.components.agents.model import Agent
 from app.components.agents.queries import get_agent
 from app.components.schedule_agents import queries as schedule_agents_queries
@@ -93,9 +92,15 @@ def find_assignment_conflicts(schedule_id: int, agent_ids: list[int]) -> list[Ag
 
 def assign_agent(schedule_id: int, agent_id: int) -> None:
     with db_session_write() as session:
-        # check-then-write must share this one locked transaction (see Global Constraints)
+        # check-then-write must share this one locked transaction (see Global Constraints).
+        # Schedule lock FIRST, then the agent lock -- the global order defined in
+        # schedules.queries.lock_schedule. The agent lock alone left this path and
+        # an hours edit with nothing in common to contend on, so both could
+        # validate against the other's stale state and commit. Taking the agent
+        # lock first here (as this used to) would invert the order and deadlock.
         lock_started = time.perf_counter()
-        session.execute(text("SELECT pg_advisory_xact_lock(:aid)"), {"aid": agent_id})
+        schedules_queries.lock_schedule(session, schedule_id)
+        agents_queries.lock_agent(session, agent_id)
         lock_wait_ms = round((time.perf_counter() - lock_started) * 1000, 2)
 
         schedule = schedules_queries.get_schedule(session, schedule_id)

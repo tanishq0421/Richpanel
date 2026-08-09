@@ -1,9 +1,21 @@
 # backend/tests/api/test_schedules_api.py
+from datetime import datetime, timedelta
+
 from fastapi.testclient import TestClient
 
+from app.domain.types import IST
 from app.main import app
 
 client = TestClient(app)
+
+
+def _day(offset: int) -> str:
+    """A date `offset` days from today, as the API spells it.
+
+    Derived rather than hardcoded: whether a start_date has elapsed is decided
+    against today in IST, so a fixed literal would silently change meaning as
+    CI's clock moves past it."""
+    return (datetime.now(IST).date() + timedelta(days=offset)).isoformat()
 
 
 def test_create_schedule(db):
@@ -132,6 +144,137 @@ def test_update_schedule_hours(db):
 
     assert response.status_code == 200
     assert response.json()["shifts"] == [{"weekday": 0, "start_hours": 8.0, "end_hours": 16.0}]
+
+
+def _create_for_edit(**overrides) -> int:
+    payload = {"name": "S", "start_date": _day(-30), "end_date": _day(30), "shifts": []}
+    payload.update(overrides)
+    response = client.post("/api/v1/schedules", json=payload)
+    assert response.status_code == 201, response.text
+    return response.json()["id"]
+
+
+def _put(schedule_id: int, **body):
+    return client.put(f"/api/v1/schedules/{schedule_id}", json={"shifts": [], **body})
+
+
+def test_extending_end_date_succeeds_and_persists(db):
+    # The headline case: "this schedule should run longer than we first said".
+    schedule_id = _create_for_edit()
+
+    response = _put(schedule_id, end_date=_day(365))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["end_date"] == _day(365)
+    assert client.get(f"/api/v1/schedules/{schedule_id}").json()["end_date"] == _day(365)
+
+
+def test_clearing_end_date_to_null_makes_the_schedule_ongoing(db):
+    schedule_id = _create_for_edit()
+
+    response = _put(schedule_id, end_date=None)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["end_date"] is None
+    assert client.get(f"/api/v1/schedules/{schedule_id}").json()["end_date"] is None
+
+
+def test_omitting_end_date_leaves_it_unchanged(db):
+    # The other half of the same distinction: an ABSENT end_date must not be
+    # read as the null above, or every hours-only edit would silently wipe the
+    # schedule's end date.
+    schedule_id = _create_for_edit(end_date=_day(30))
+
+    response = _put(schedule_id)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["end_date"] == _day(30)
+
+
+def test_end_date_before_start_date_on_update_returns_422(db):
+    schedule_id = _create_for_edit(start_date=_day(-30))
+
+    response = _put(schedule_id, start_date=_day(-30), end_date=_day(-60))
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error_code"] == "validation_error"
+
+
+def test_changing_an_elapsed_start_date_is_rejected(db):
+    schedule_id = _create_for_edit(start_date=_day(-30))
+
+    response = _put(schedule_id, start_date=_day(-10))
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error_code"] == "validation_error"
+    message = response.json()["message"]
+    assert "start_date" in message and "already begun" in message
+
+
+def test_a_start_date_of_today_is_already_frozen(db):
+    # The boundary: the period has begun the moment the day starts in IST.
+    schedule_id = _create_for_edit(start_date=_day(0))
+
+    assert _put(schedule_id, start_date=_day(7)).status_code == 400
+
+
+def test_resending_the_same_elapsed_start_date_alongside_a_new_end_date_succeeds(db):
+    # An unchanged field is not a change. A naive implementation rejects this
+    # and makes the endpoint unusable for every schedule that has begun --
+    # which is most of them, since clients post the whole form back.
+    schedule_id = _create_for_edit(start_date=_day(-30), end_date=_day(30))
+
+    response = _put(schedule_id, start_date=_day(-30), end_date=_day(90))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["start_date"] == _day(-30)
+    assert response.json()["end_date"] == _day(90)
+
+
+def test_changing_a_still_future_start_date_succeeds(db):
+    schedule_id = _create_for_edit(start_date=_day(10), end_date=None)
+
+    response = _put(schedule_id, start_date=_day(20))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["start_date"] == _day(20)
+    assert client.get(f"/api/v1/schedules/{schedule_id}").json()["start_date"] == _day(20)
+
+
+def test_renaming_a_schedule_succeeds_and_persists(db):
+    schedule_id = _create_for_edit(name="Old Name")
+
+    response = _put(schedule_id, name="New Name")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["name"] == "New Name"
+    assert client.get(f"/api/v1/schedules/{schedule_id}").json()["name"] == "New Name"
+
+
+def test_renaming_to_an_empty_name_returns_422(db):
+    schedule_id = _create_for_edit()
+    assert _put(schedule_id, name="").status_code == 422
+
+
+def test_explicitly_nulling_a_non_nullable_field_returns_422(db):
+    # Both columns are NOT NULL, so null must be named as a 422 rather than
+    # reaching the database and coming back as a 500.
+    schedule_id = _create_for_edit()
+    assert _put(schedule_id, name=None).status_code == 422
+    assert _put(schedule_id, start_date=None).status_code == 422
+
+
+def test_editing_hours_alongside_the_dates_still_replaces_the_hours(db):
+    schedule_id = _create_for_edit(shifts=[{"weekday": 0, "start_hours": 9, "end_hours": 17}])
+
+    response = client.put(
+        f"/api/v1/schedules/{schedule_id}",
+        json={"shifts": [{"weekday": 1, "start_hours": 8, "end_hours": 16}], "name": "Renamed"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["shifts"] == [{"weekday": 1, "start_hours": 8.0, "end_hours": 16.0}]
+    assert response.json()["name"] == "Renamed"
 
 
 def test_deletion_impact_and_delete(db):

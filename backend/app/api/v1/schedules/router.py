@@ -48,7 +48,14 @@ def get_schedule(schedule_id: int):
 
 @router.put("/{schedule_id}", response_model=ScheduleResponse)
 def update_schedule(schedule_id: int, request: ScheduleUpdateRequest):
-    detail = schedule_service.update_schedule_hours(schedule_id, [s.to_domain() for s in request.shifts])
+    detail = schedule_service.update_schedule(
+        schedule_id,
+        [s.to_domain() for s in request.shifts],
+        # Splatting only the keys the payload carried is what keeps "absent"
+        # distinct from "explicitly null" -- an omitted field never becomes an
+        # argument, so the service's UNCHANGED default applies.
+        **request.attribute_changes(),
+    )
     return _to_response(detail)
 
 

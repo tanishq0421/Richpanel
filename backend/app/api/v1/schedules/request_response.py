@@ -88,12 +88,52 @@ class ScheduleCreateRequest(BaseModel):
 
 
 class ScheduleUpdateRequest(BaseModel):
+    """PUT replaces the schedule's hours wholesale -- `shifts` stays required,
+    exactly as before -- and applies a PARTIAL update to the schedule's own
+    attributes: a field the payload does not carry is left alone.
+
+    That distinction is load-bearing for `end_date`, where null is a MEANINGFUL
+    value ("ongoing", no configured end) rather than "no opinion". A plain
+    `end_date: date | None = None` cannot tell an omitted field from an explicit
+    null, so the two collapse and clearing an end date becomes unexpressible.
+    Pydantic's `model_fields_set` -- the record of what the payload actually
+    carried -- is what separates them, and attribute_changes() returns only
+    those keys."""
+
     shifts: list[ShiftInputSchema]
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    start_date: date | None = None
+    end_date: date | None = None
 
     @model_validator(mode="after")
     def _validate_relationships(self):
         _reject_duplicate_weekdays(self.shifts)
+        for field in ("name", "start_date"):
+            # Both columns are NOT NULL. Without this an explicit null reaches
+            # the database and comes back as a 500 rather than a named 422.
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"{field} cannot be null; omit the field to leave it unchanged")
+        # Only decidable here when the payload carries BOTH dates. Comparing a
+        # sent date against a STORED one needs the row, so schedule_service
+        # repeats the rule on the effective values -- see
+        # _resolve_attribute_changes(). This copy exists so the ordinary case
+        # (an edit form posting the whole header back) fails the same way, with
+        # the same 422 and field-level detail, as it does on create.
+        if {"start_date", "end_date"} <= self.model_fields_set:
+            if self.end_date is not None and self.end_date < self.start_date:
+                raise ValueError("end_date must be on or after start_date")
         return self
+
+    def attribute_changes(self) -> dict[str, str | date | None]:
+        """Exactly the schedule-level fields the payload carried, ready to splat
+        into schedule_service.update_schedule(). An omitted field is simply not
+        a key, so the service's UNCHANGED default stands; `end_date: null`
+        arrives as a real None and clears the column."""
+        return {
+            field: getattr(self, field)
+            for field in ("name", "start_date", "end_date")
+            if field in self.model_fields_set
+        }
 
 
 class ScheduleResponse(BaseModel):
