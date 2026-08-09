@@ -184,11 +184,15 @@ imports `@/hooks/...`, never `../../api/http`.
 
 ### 3.1 Prerequisites
 
-| Path | Needs |
+Pick **one** path — they're alternatives, not a combined checklist. Docker
+needs nothing else: Python/`uv` and Node/npm are baked into their own images,
+never installed on the host.
+
+| Path | Needs on your machine |
 |---|---|
-| Docker | Docker Desktop / Colima with Compose v2 |
-| Local backend | Python 3.14, [`uv`](https://docs.astral.sh/uv/), a reachable Postgres |
-| Local frontend | Node 22+, npm |
+| Docker (§3.2) | Docker Desktop / Colima with Compose v2 — nothing else |
+| Local backend (§3.3) | Python 3.14, [`uv`](https://docs.astral.sh/uv/), a reachable Postgres |
+| Local frontend (§3.4) | Node 22+, npm |
 
 ### 3.2 Docker — the one-command path
 
