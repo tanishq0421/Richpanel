@@ -116,12 +116,19 @@ function conflictReason(conflict: ScheduleConflictDTO): string {
  */
 export function AssignAgentModal({ open, onOpenChange, scheduleId }: AssignAgentModalProps) {
   const { toast } = useToast()
-  const agents = useAgents()
+  const [search, setSearch] = useState('')
+  // Debounced: the search box drives a real server round trip (`q`), scoped
+  // to the whole directory rather than whatever pages happen to be loaded
+  // already, so it is what makes an agent past the first page findable at
+  // all. Debouncing keeps that round trip to one per pause in typing rather
+  // than one per keystroke; the instant, in-memory narrowing below (`filtered`)
+  // is what keeps the list responsive on every keystroke in the meantime.
+  const [debouncedSearch, setDebouncedSearch] = useState('')
+  const agents = useAgents(debouncedSearch)
   const assignees = useScheduleAssignees(open ? scheduleId : null)
   const assign = useAssignAgent()
   const unassign = useUnassignAgent()
 
-  const [search, setSearch] = useState('')
   const [selectedIds, setSelectedIds] = useState<number[]>([])
   const [problem, setProblem] = useState<string | null>(null)
   // Assignments this batch already landed. The assignees query is invalidated
@@ -135,11 +142,17 @@ export function AssignAgentModal({ open, onOpenChange, scheduleId }: AssignAgent
 
   const listRef = useRef<HTMLDivElement>(null)
 
+  useEffect(() => {
+    const id = setTimeout(() => setDebouncedSearch(search.trim()), 300)
+    return () => clearTimeout(id)
+  }, [search])
+
   // Reopening for a different schedule must not inherit the previous answers —
   // a stale selection here would assign the wrong people in one click.
   useEffect(() => {
     if (open) {
       setSearch('')
+      setDebouncedSearch('')
       setSelectedIds([])
       setProblem(null)
       setAssignedNow([])
@@ -567,6 +580,23 @@ export function AssignAgentModal({ open, onOpenChange, scheduleId }: AssignAgent
                 )
               })}
             </div>
+
+            {/* The directory is fetched a page at a time (`useAgents`'s own
+                page cap), not all at once — this is what keeps the picker
+                usable for an org with thousands of agents. Search reaches a
+                specific agent directly; this is for browsing past the first
+                page without one. */}
+            {agents.hasNextPage && (
+              <Button
+                variant="secondary"
+                className="w-full"
+                loading={agents.isFetchingNextPage}
+                disabled={isAssigning}
+                onClick={() => agents.fetchNextPage()}
+              >
+                {agents.isFetchingNextPage ? 'Loading more…' : 'Load more agents'}
+              </Button>
+            )}
           </>
         )}
       </div>
