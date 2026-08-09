@@ -8,6 +8,7 @@ from app.components.agents.model import Agent
 from app.components.agents.queries import get_agent
 from app.components.schedule_agents import queries as schedule_agents_queries
 from app.components.schedules import queries as schedules_queries
+from app.components.schedules.model import Schedule
 from app.db import db_session_read, db_session_write
 from app.domain.overlap import find_overlaps
 from app.domain.types import WeekdayShift
@@ -63,3 +64,9 @@ def list_assignees(schedule_id: int) -> list[Agent]:
     with db_session_read() as session:
         agent_ids = schedule_agents_queries.list_active_assignee_agent_ids(session, schedule_id)
         return [get_agent(session, aid) for aid in agent_ids]
+
+
+def list_schedules_for_agent(agent_id: int) -> list[Schedule]:
+    with db_session_read() as session:
+        schedule_ids = schedule_agents_queries.get_other_active_schedule_ids_for_agent(session, agent_id)
+        return [schedules_queries.get_schedule(session, sid) for sid in schedule_ids]

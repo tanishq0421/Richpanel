@@ -6,7 +6,12 @@ import pytest
 from app.db import db_session_write
 from app.domain.types import ShiftInput
 from app.errors.error import AssignmentOverlapError, NotFoundError
-from app.services.assignment_service import assign_agent, list_assignees, unassign_agent
+from app.services.assignment_service import (
+    assign_agent,
+    list_assignees,
+    list_schedules_for_agent,
+    unassign_agent,
+)
 from app.services.schedule_service import create_schedule
 
 
@@ -89,3 +94,13 @@ def test_reassign_after_unassign_succeeds(db):
     assign_agent(schedule.id, agent_id)
 
     assert {a.id for a in list_assignees(schedule.id)} == {agent_id}
+
+
+def test_list_schedules_for_agent_returns_active_schedules(db):
+    schedule = create_schedule(name="A", start_date=date(2026, 1, 1), end_date=None, shift_inputs=[])
+    agent_id = _create_agent()
+    assign_agent(schedule.id, agent_id)
+
+    result = list_schedules_for_agent(agent_id)
+
+    assert [s.id for s in result] == [schedule.id]
