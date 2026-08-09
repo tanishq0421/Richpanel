@@ -123,6 +123,9 @@ def update_schedule_hours(schedule_id: int, shift_inputs: list[ShiftInput]) -> S
                 raise AssignmentOverlapError(agent_id=agent_id, conflicts=conflicts)
 
         schedules_queries.replace_weekday_hours_rows(session, schedule_id, normalized_shifts)
+        # The hours live in a child table, so nothing above updates the schedule
+        # row -- without this, "last modified" would never move.
+        schedules_queries.touch_schedule(session, schedule_id)
         rows = schedules_queries.get_weekday_hours_rows(session, schedule_id)
         detail = _to_detail(schedule, rows)
 

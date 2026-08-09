@@ -10,6 +10,7 @@ from app.components.schedules.queries import (
     replace_weekday_hours_rows,
     soft_delete_schedule,
     soft_delete_weekday_hours_for_schedule,
+    touch_schedule,
 )
 from app.domain.types import WeekdayShift
 
@@ -78,6 +79,37 @@ def test_replace_weekday_hours_rows_swaps_old_for_new(db):
     rows = get_weekday_hours_rows(db, schedule.id)
     assert len(rows) == 1
     assert rows[0].start_time == timedelta(hours=8)
+
+
+def test_weekday_hours_rows_record_when_they_were_created(db):
+    # The table used to store deleted_at with no created_at: it could say when a
+    # row stopped applying but never when it started.
+    schedule = create_schedule(db, name="Day Shift", start_date=date(2026, 1, 1), end_date=None)
+    db.commit()
+    insert_weekday_hours_rows(
+        db, schedule.id, [WeekdayShift(weekday=0, start_time=timedelta(hours=9), end_time=timedelta(hours=17))]
+    )
+    db.commit()
+
+    row = get_weekday_hours_rows(db, schedule.id)[0]
+    assert row.created_at is not None
+    assert row.updated_at is not None
+
+
+def test_touch_schedule_moves_updated_at_past_created_at(db):
+    # updated_at previously equalled created_at forever: declared with a
+    # server_default and never assigned by anything.
+    schedule = create_schedule(db, name="Day Shift", start_date=date(2026, 1, 1), end_date=None)
+    db.commit()
+    created_at, before = schedule.created_at, schedule.updated_at
+
+    touch_schedule(db, schedule.id)
+    db.commit()
+    db.refresh(schedule)
+
+    assert schedule.updated_at > before
+    assert schedule.updated_at > created_at
+    assert schedule.created_at == created_at  # creation time must not move
 
 
 def test_soft_delete_weekday_hours_for_schedule(db):

@@ -25,6 +25,16 @@ def list_active_schedules(session: Session, limit: int, offset: int) -> list[Sch
     return list(session.scalars(stmt))
 
 
+def touch_schedule(session: Session, schedule_id: int) -> None:
+    """Bump updated_at on the schedule itself.
+
+    Needed because editing weekday hours rewrites rows in
+    schedule_weekday_hours and never issues an UPDATE against schedules -- so
+    the column's onupdate can never fire, and 'last modified' would stay at the
+    creation time no matter how often the hours changed."""
+    session.execute(update(Schedule).where(Schedule.id == schedule_id).values(updated_at=datetime.now(IST)))
+
+
 def soft_delete_schedule(session: Session, schedule_id: int) -> None:
     session.execute(update(Schedule).where(Schedule.id == schedule_id).values(deleted_at=datetime.now(IST)))
 
