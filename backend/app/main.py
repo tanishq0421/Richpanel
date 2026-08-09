@@ -5,6 +5,7 @@ import time
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from app.api.v1.agents.router import router as agents_router
 from app.errors.error import AppError, ConflictError, DomainValidationError, NotFoundError
 from app.logging_config import configure_logging
 
@@ -64,6 +65,8 @@ def register_request_logging(app: FastAPI) -> None:
 app = FastAPI(title="Richpanel Schedule & Resolution Time Report")
 register_exception_handlers(app)
 register_request_logging(app)
+
+app.include_router(agents_router)
 
 
 @app.get("/health")
