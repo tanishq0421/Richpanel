@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.api.v1.agents.router import router as agents_router
+from app.api.v1.reports.router import router as reports_router
 from app.api.v1.schedule_agents.router import router as schedule_agents_router
 from app.api.v1.schedules.router import router as schedules_router
 from app.errors.error import AppError, ConflictError, DomainValidationError, NotFoundError
@@ -71,6 +72,7 @@ register_request_logging(app)
 app.include_router(agents_router)
 app.include_router(schedules_router)
 app.include_router(schedule_agents_router)
+app.include_router(reports_router)
 
 
 @app.get("/health")
