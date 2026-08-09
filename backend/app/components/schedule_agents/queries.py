@@ -5,6 +5,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.components.schedule_agents.model import ScheduleAgent
+from app.domain.types import IST
 
 
 def create_assignment(session: Session, schedule_id: int, agent_id: int) -> ScheduleAgent:
@@ -22,7 +23,7 @@ def soft_delete_assignment(session: Session, schedule_id: int, agent_id: int) ->
             ScheduleAgent.agent_id == agent_id,
             ScheduleAgent.deleted_at.is_(None),
         )
-        .values(deleted_at=datetime.now())
+        .values(deleted_at=datetime.now(IST))
     )
 
 
@@ -48,5 +49,5 @@ def soft_delete_assignments_for_schedule(session: Session, schedule_id: int) -> 
     session.execute(
         update(ScheduleAgent)
         .where(ScheduleAgent.schedule_id == schedule_id, ScheduleAgent.deleted_at.is_(None))
-        .values(deleted_at=datetime.now())
+        .values(deleted_at=datetime.now(IST))
     )

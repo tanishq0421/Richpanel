@@ -1,8 +1,18 @@
 from dataclasses import dataclass
 from datetime import timedelta
+from zoneinfo import ZoneInfo
 
 ZERO = timedelta()
 END_OF_DAY = timedelta(hours=24)
+
+# The single system-wide timezone (spec 4.1, previously left open). Every
+# schedule's weekday hours and every ticket window are interpreted as IST
+# (UTC+05:30) wall-clock time. Storage stays timestamptz so a ticket window
+# remains a real instant; this constant is the one place that decides how those
+# instants map onto weekdays and offsets-from-midnight. If per-schedule
+# timezones are ever required, this constant is the extension point -- nothing
+# else in the codebase hardcodes a zone.
+IST = ZoneInfo("Asia/Kolkata")
 
 
 @dataclass(frozen=True)

@@ -5,7 +5,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.components.schedules.model import Schedule, ScheduleWeekdayHours
-from app.domain.types import WeekdayShift
+from app.domain.types import IST, WeekdayShift
 
 
 def create_schedule(session: Session, name: str, start_date: date, end_date: date | None) -> Schedule:
@@ -26,7 +26,7 @@ def list_active_schedules(session: Session, limit: int, offset: int) -> list[Sch
 
 
 def soft_delete_schedule(session: Session, schedule_id: int) -> None:
-    session.execute(update(Schedule).where(Schedule.id == schedule_id).values(deleted_at=datetime.now()))
+    session.execute(update(Schedule).where(Schedule.id == schedule_id).values(deleted_at=datetime.now(IST)))
 
 
 def insert_weekday_hours_rows(session: Session, schedule_id: int, shifts: list[WeekdayShift]) -> None:
@@ -66,5 +66,5 @@ def soft_delete_weekday_hours_for_schedule(session: Session, schedule_id: int) -
     session.execute(
         update(ScheduleWeekdayHours)
         .where(ScheduleWeekdayHours.schedule_id == schedule_id, ScheduleWeekdayHours.deleted_at.is_(None))
-        .values(deleted_at=datetime.now())
+        .values(deleted_at=datetime.now(IST))
     )
