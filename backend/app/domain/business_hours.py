@@ -37,7 +37,12 @@ def calculate_business_seconds(shifts: list[WeekdayShift], window_start: datetim
 
     next_midnight = datetime.combine(window_start.date(), datetime.min.time()) + timedelta(days=1)
 
-    if window_end <= next_midnight:
+    # Strictly less-than, NOT <=. When window_end IS next_midnight, its
+    # offset-from-midnight is measured against its OWN date and so is zero,
+    # collapsing this branch's interval to [start_offset, 0) and returning 0 for
+    # what is actually a full day. `Mon 00:00 -> Tue 00:00` silently reported
+    # zero hours -- the single most natural report an admin can ask for.
+    if window_end < next_midnight:
         total = _day_overlap(
             by_weekday[_weekday_of(window_start)], _day_offset_of(window_start), _day_offset_of(window_end)
         )

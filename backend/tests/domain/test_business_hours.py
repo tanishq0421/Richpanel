@@ -79,6 +79,62 @@ def test_window_length_does_not_change_per_day_cost_only_the_total():
     assert seconds > 88 * 3600  # strictly more than the 15-day window's total
 
 
+def test_window_ending_exactly_at_midnight_counts_the_full_day():
+    # Regression: `window_end <= next_midnight` took the single-day branch and
+    # measured window_end's offset against its own date (zero), returning 0 for
+    # a full working day. A one-day report is the most natural query there is.
+    shifts = build_shifts([shift(wd, 9, 17) for wd in range(5)])
+    seconds = calculate_business_seconds(shifts, datetime(2026, 1, 5, 0, 0, 0), datetime(2026, 1, 6, 0, 0, 0))
+    assert seconds == 8 * 3600
+
+
+def test_partial_day_ending_exactly_at_midnight():
+    shifts = build_shifts([shift(wd, 9, 17) for wd in range(5)])
+    seconds = calculate_business_seconds(shifts, datetime(2026, 1, 5, 10, 0, 0), datetime(2026, 1, 6, 0, 0, 0))
+    assert seconds == 7 * 3600
+
+
+def test_window_of_exactly_seven_days_equals_one_weekly_total():
+    shifts = build_shifts([shift(wd, 9, 17) for wd in range(5)])
+    seconds = calculate_business_seconds(shifts, datetime(2026, 1, 5, 0, 0, 0), datetime(2026, 1, 12, 0, 0, 0))
+    assert seconds == 40 * 3600  # five 8h days
+
+
+def test_window_of_exactly_eight_days_adds_one_remainder_day():
+    shifts = build_shifts([shift(wd, 9, 17) for wd in range(5)])
+    seconds = calculate_business_seconds(shifts, datetime(2026, 1, 5, 0, 0, 0), datetime(2026, 1, 13, 0, 0, 0))
+    assert seconds == 48 * 3600  # 40h + the following Monday
+
+
+def test_matches_brute_force_reference_across_boundary_windows():
+    """Cross-check the closed form against a minute-by-minute count. This is the
+    check that would have caught the midnight bug: it makes no assumption about
+    which branch runs."""
+    shifts = build_shifts([shift(wd, 9, 17) for wd in range(5)])
+
+    def brute_force(start: datetime, end: datetime) -> int:
+        total = 0
+        cursor = start
+        while cursor < end:
+            offset = cursor - datetime.combine(cursor.date(), datetime.min.time())
+            for s in shifts:
+                if s.weekday == cursor.weekday() and s.start_time <= offset < s.end_time:
+                    total += 60
+                    break
+            cursor += timedelta(minutes=1)
+        return total
+
+    windows = [
+        (datetime(2026, 1, 5, 0, 0), datetime(2026, 1, 6, 0, 0)),
+        (datetime(2026, 1, 5, 10, 0), datetime(2026, 1, 6, 0, 0)),
+        (datetime(2026, 1, 5, 23, 0), datetime(2026, 1, 6, 3, 0)),
+        (datetime(2026, 1, 9, 12, 0), datetime(2026, 1, 12, 12, 0)),
+        (datetime(2026, 1, 5, 0, 0), datetime(2026, 1, 12, 0, 0)),
+    ]
+    for start, end in windows:
+        assert calculate_business_seconds(shifts, start, end) == brute_force(start, end), f"{start} -> {end}"
+
+
 def test_rejects_window_end_before_start():
     with pytest.raises(ValueError, match="after"):
         calculate_business_seconds([], WINDOW_END, WINDOW_START)
