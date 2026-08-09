@@ -56,8 +56,15 @@ COPY . .
 # Injected by Compose from APP_BASE_URL. Rename to REACT_APP_API_BASE_URL /
 # NEXT_PUBLIC_API_BASE_URL etc. to match your framework's convention, and
 # update the matching `args:` key in docker-compose.yml.
-ARG VITE_API_BASE_URL=http://localhost:8000
-ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
+# Must match BOTH the name docker-compose.yml passes as a build arg AND the name
+# src/api/http.ts reads (import.meta.env.VITE_APP_BASE_URL). It previously read
+# VITE_API_BASE_URL here -- API vs APP -- and Docker silently drops a build arg
+# the Dockerfile does not declare, so the compose value was discarded and every
+# image fell back to the default below. Locally that default is correct, which
+# is exactly why it went unnoticed; any other environment would have shipped a
+# bundle pointing at localhost.
+ARG VITE_APP_BASE_URL=http://localhost:8000
+ENV VITE_APP_BASE_URL=${VITE_APP_BASE_URL}
 
 # NODE_ENV=production enables minification / dead-code elimination.
 ENV NODE_ENV=production
