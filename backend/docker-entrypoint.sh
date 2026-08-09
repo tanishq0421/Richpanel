@@ -42,6 +42,21 @@ while : ; do
     sleep "${MIGRATION_RETRY_DELAY}"
 done
 
+# Agents cannot be created through the API by design (spec NFR #1), so a fresh
+# database has no agents at all and the Resolution Time Report would render an
+# empty table. Seeding here means `docker compose up` yields a usable system.
+#
+# The script is idempotent — it takes an advisory lock, counts the table, and
+# returns without writing when any agent already exists — so this is safe on
+# every restart and with more than one replica booting at once.
+#
+# Non-fatal on purpose: a failed seed is a convenience problem, not a reason to
+# refuse to serve traffic. It is logged loudly instead.
+echo "[entrypoint] seeding agents if the table is empty"
+if ! python -m scripts.seed_agents; then
+    echo "[entrypoint] WARNING: agent seeding failed; continuing to start the API" >&2
+fi
+
 echo "[entrypoint] starting uvicorn on 0.0.0.0:${APP_PORT} with ${UVICORN_WORKERS} worker(s)"
 
 # No --reload: this is a production process model.
