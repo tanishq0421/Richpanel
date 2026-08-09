@@ -29,7 +29,6 @@ def test_write_session_rolls_back_on_exception(db):
     assert count == 0
 
 
-@pytest.mark.skip(reason="Agent model added in Task 8")
 def test_read_session_has_no_commit_side_effect(db):
     from app.components.agents.model import Agent  # exists starting Task 8
 
