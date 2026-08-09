@@ -47,6 +47,27 @@ export class ApiError extends Error {
     return this.details.find((d) => d.field === field || d.field.startsWith(`${field}.`))?.message
   }
 
+  /**
+   * The message for a whole-request (model-level) validation failure, as
+   * opposed to one attributable to a single field.
+   *
+   * A Pydantic `@model_validator` that compares more than one field together
+   * (end_date vs start_date, a report window vs "now") can only address the
+   * object being validated, not a member of it, so FastAPI reports it with
+   * `field: "body"` rather than a field name. `fieldError('some_field')`
+   * cannot find this — it was first found missing on the report form (a 422
+   * whose details all lived under "body" produced no field error AND no
+   * generic banner, since a validation error with any details at all
+   * suppressed the fallback: the request was correctly rejected and the UI
+   * said nothing). Centralised here — rather than reimplemented per form —
+   * because that bug is exactly as likely on any OTHER model-level validator
+   * (there are several: schedule name/dates, one-window-per-weekday) unless
+   * every form remembers to check for it independently.
+   */
+  get bodyError(): string | undefined {
+    return this.fieldError('body')
+  }
+
   /** Retrying is only sensible for transient transport/server failures — never
    *  for a 4xx, which will fail identically until the input changes. */
   get isRetryable(): boolean {

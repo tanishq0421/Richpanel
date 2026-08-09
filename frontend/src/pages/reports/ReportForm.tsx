@@ -24,18 +24,23 @@ const FUTURE_WINDOW_MESSAGE = "A report can't cover time that hasn't happened ye
 
 /**
  * The future-window rule is a pydantic *model* validator, so FastAPI's `loc` is
- * `("body",)` and the detail reaches us as field "body" — verified against the
- * running API, not assumed. `fieldError('ticket_end_at')` misses it entirely,
- * and since the failure is still a 422 carrying details the banner suppressed
- * itself too: the submit was rejected and the form said nothing at all.
+ * `("body",)` and the detail reaches us via `ApiError.bodyError` rather than
+ * `fieldError('ticket_end_at')` — verified against the running API, not
+ * assumed. This was originally patched here alone; `ApiError.bodyError` now
+ * centralises the lookup so the same class of bug doesn't have to be
+ * rediscovered on every other model-level validator (schedule name/dates,
+ * one-window-per-weekday) independently.
  *
  * The detail names the field it concerns inside its own message, and that is
- * what routes it. The wording is replaced rather than passed through: "Value
- * error, ticket_end_at must not be later than the current time" is written for
- * whoever wrote the endpoint, not for the person looking at the screen.
+ * what routes it to a specific control here — this form pins the message to
+ * whichever of the two datetime fields the backend's text mentions, rather
+ * than showing a single undifferentiated banner. The wording is replaced
+ * rather than passed through: "Value error, ticket_end_at must not be later
+ * than the current time" is written for whoever wrote the endpoint, not for
+ * the person looking at the screen.
  */
 function modelLevelFutureError(error: ApiError, field: string): string | undefined {
-  const modelLevel = error.fieldError('body')
+  const modelLevel = error.bodyError
   if (!modelLevel || !/future/i.test(modelLevel) || !modelLevel.includes(field)) return undefined
   return FUTURE_WINDOW_MESSAGE
 }

@@ -23,13 +23,21 @@ function fieldError(error: unknown, field: string): string | undefined {
  * displayed next to the offending inputs would only be repeated here, but a 409,
  * a 500, a timeout or a dropped connection has nowhere else to go — and a form
  * that fails silently is worse than one that fails loudly.
+ *
+ * The `details.length > 0` suppression below used to hide the banner for EVERY
+ * validation error that carried any detail at all — including a body-level one
+ * (see `ApiError.bodyError`), which no per-field control ever renders. That
+ * combination meant a genuinely rejected submission could show nothing: not a
+ * field error (nothing matched), not this banner (suppressed because details
+ * existed). `bodyError` is checked explicitly so that specific case still
+ * surfaces here.
  */
 function SubmitError({ error, onDismiss }: { error: unknown; onDismiss: () => void }) {
   if (!error) return null
 
   if (error instanceof ApiError) {
     if (error.kind === 'conflict') return <ConflictBanner message={error.message} onDismiss={onDismiss} />
-    if (error.kind === 'validation' && error.details.length > 0) return null
+    if (error.kind === 'validation' && error.details.length > 0 && !error.bodyError) return null
   }
 
   return (

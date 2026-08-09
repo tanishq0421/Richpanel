@@ -186,7 +186,6 @@ vi.mock('@/components/datetime', () => ({
       {error ? <span>{`${label} error: ${error}`}</span> : null}
     </div>
   ),
-  DateRangePicker: () => null,
   DatePicker: ({
     value,
     onChange,
@@ -328,6 +327,27 @@ describe('SchedulesPage', () => {
     // … and the form still holds everything the user entered.
     expect(name).toHaveValue('Night shift')
     expect(screen.getByText(`Starts = ${h.stamp(h.today)}`)).toBeInTheDocument()
+  })
+
+  it('shows a banner for a body-level (whole-request) 422, not silence', async () => {
+    // A model validator that compares two fields together (end_date vs
+    // start_date, one-window-per-weekday) reports with field: "body" rather
+    // than a field name. Previously: no per-field control matched it, AND the
+    // generic banner suppressed itself just because *some* detail existed --
+    // so a genuinely rejected submit produced no visible error at all.
+    const user = userEvent.setup()
+    h.state.schedules = { data: [SCHEDULE], isLoading: false, error: null, refetch: () => {} }
+    h.state.createError = new ApiError('validation', 422, 'validation_error', 'request validation failed', [
+      { field: 'body', message: 'end_date must be on or after start_date', type: 'value_error' },
+    ])
+
+    renderPage(<SchedulesPage />)
+    await user.click(screen.getByRole('button', { name: 'New schedule' }))
+    await user.type(screen.getByLabelText(/schedule name/i), 'Night shift')
+    await user.click(screen.getByRole('button', { name: 'set Starts today' }))
+    await user.click(screen.getByRole('button', { name: 'Create schedule' }))
+
+    expect(await screen.findByText('end_date must be on or after start_date')).toBeInTheDocument()
   })
 
   /**
