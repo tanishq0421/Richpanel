@@ -3,6 +3,7 @@ import logging
 import time
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.api.v1.agents.router import router as agents_router
@@ -34,6 +35,32 @@ def register_exception_handlers(app: FastAPI) -> None:
             return _handler
 
         app.add_exception_handler(error_type, _make_handler())
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error_handler(request: Request, exc: RequestValidationError):
+        """FastAPI's native 422 body is `{"detail": [...]}` — a different shape
+        from the `{"error_code", "message"}` envelope every other error uses.
+        Normalising it here means the UI parses ONE error shape, and can still
+        map each failure back onto the form control that caused it via `field`."""
+        details = [
+            {
+                # Drop the leading "body"/"query" segment: the client cares about
+                # the field path within its own payload, not FastAPI's location
+                # tuple. `shifts.0.start_hours` is directly addressable in a form.
+                "field": ".".join(str(part) for part in error["loc"][1:]) or ".".join(str(p) for p in error["loc"]),
+                "message": error["msg"],
+                "type": error["type"],
+            }
+            for error in exc.errors()
+        ]
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error_code": "validation_error",
+                "message": "request validation failed",
+                "details": details,
+            },
+        )
 
     @app.exception_handler(Exception)
     async def _unhandled_exception_handler(request: Request, exc: Exception):
