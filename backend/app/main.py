@@ -1,9 +1,11 @@
 # backend/app/main.py
 import logging
+import os
 import time
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.v1.agents.router import router as agents_router
@@ -92,7 +94,26 @@ def register_request_logging(app: FastAPI) -> None:
         return response
 
 
+def register_cors(app: FastAPI) -> None:
+    """The UI is served from its own container on its own port, so every browser
+    call to this API is cross-origin. Without this the browser blocks the
+    response before any application code runs — the API simply appears dead to
+    the UI. Origins are enumerated rather than wildcarded: `*` is incompatible
+    with credentialed requests, and an explicit list is the safer default for a
+    tool holding operational data."""
+    raw = os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:5173")
+    origins = [origin.strip().rstrip("/") for origin in raw.split(",") if origin.strip()]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type", "Authorization"],
+    )
+
+
 app = FastAPI(title="Richpanel Schedule & Resolution Time Report")
+register_cors(app)
 register_exception_handlers(app)
 register_request_logging(app)
 
