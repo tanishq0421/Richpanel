@@ -16,7 +16,7 @@ vi.mock('@/api/apiService', () => ({
       deletionImpact: vi.fn(),
       remove: vi.fn(),
     },
-    assignments: { listAssignees: vi.fn(), assign: vi.fn(), unassign: vi.fn() },
+    assignments: { listAssignees: vi.fn(), check: vi.fn(), assign: vi.fn(), unassign: vi.fn() },
     reports: { generate: vi.fn(), list: vi.fn(), get: vi.fn() },
   },
 }))
@@ -29,6 +29,10 @@ import { useAssignAgent } from '@/hooks/mutations/useAssignAgent'
 import { useCreateSchedule } from '@/hooks/mutations/useCreateSchedule'
 import { useDeleteSchedule } from '@/hooks/mutations/useDeleteSchedule'
 import { useAgents } from '@/hooks/queries/useAgents'
+import {
+  useAssignmentConflicts,
+  useRecheckAssignmentConflicts,
+} from '@/hooks/queries/useAssignmentConflicts'
 import { useDeletionImpact } from '@/hooks/queries/useDeletionImpact'
 import { useSchedules } from '@/hooks/queries/useSchedules'
 import { queryKeys } from '@/hooks/queryKeys'
@@ -130,6 +134,106 @@ describe('queries', () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true))
     expect(apiService.schedules.deletionImpact).toHaveBeenCalledWith(7)
     expect(result.current.data?.affected_agent_ids).toEqual([1, 2])
+  })
+})
+
+// ── Assignment conflict pre-check ───────────────────────────────────────────
+
+const CONFLICTS = [
+  {
+    agent_id: 5,
+    agent_name: 'Alice Chen',
+    conflicts: [
+      {
+        schedule_id: 1,
+        schedule_name: 'Day Shift',
+        colliding_shifts: [
+          {
+            weekday: 0 as const,
+            existing_start_hours: 9,
+            existing_end_hours: 17,
+            new_start_hours: 12,
+            new_end_hours: 20,
+          },
+        ],
+      },
+    ],
+  },
+]
+
+describe('useAssignmentConflicts', () => {
+  it('asks nothing until the picker is open and the directory has loaded', async () => {
+    vi.mocked(apiService.assignments.check).mockResolvedValue({ conflicts: CONFLICTS })
+    const wrapper = wrapperFor(makeClient())
+
+    const { result, rerender } = renderHook(
+      ({ id, ids }: { id: number | null; ids: number[] }) => useAssignmentConflicts(id, ids),
+      { wrapper, initialProps: { id: null as number | null, ids: [] as number[] } },
+    )
+
+    // Modal shut.
+    expect(result.current.fetchStatus).toBe('idle')
+
+    // Modal open, directory still in flight — there is no question to ask yet.
+    rerender({ id: 7, ids: [] })
+    expect(result.current.fetchStatus).toBe('idle')
+    expect(apiService.assignments.check).not.toHaveBeenCalled()
+
+    rerender({ id: 7, ids: [6, 5] })
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    // Sorted, so {6,5} and {5,6} are one cache entry rather than two identical
+    // round-trips.
+    expect(apiService.assignments.check).toHaveBeenCalledWith(7, [5, 6])
+    // Unwrapped to the list — every caller wants the conflicts, not the envelope.
+    expect(result.current.data).toEqual(CONFLICTS)
+  })
+
+  it('files both id orders under one cache entry', async () => {
+    const client = makeClient()
+    vi.mocked(apiService.assignments.check).mockResolvedValue({ conflicts: CONFLICTS })
+    const wrapper = wrapperFor(client)
+
+    const first = renderHook(() => useAssignmentConflicts(7, [5, 6]), { wrapper })
+    await waitFor(() => expect(first.result.current.isSuccess).toBe(true))
+
+    // Reversed ids: the same question, so the answer is already there on the
+    // first render rather than after a round-trip.
+    const second = renderHook(() => useAssignmentConflicts(7, [6, 5]), { wrapper })
+    expect(second.result.current.data).toEqual(CONFLICTS)
+
+    expect(client.getQueryCache().findAll({ queryKey: queryKeys.schedules.assignmentChecks(7) })).toHaveLength(1)
+  })
+
+  it('useRecheckAssignmentConflicts falsifies every check held for the schedule', async () => {
+    const client = makeClient()
+    vi.mocked(apiService.assignments.check).mockResolvedValue({ conflicts: CONFLICTS })
+    const wrapper = wrapperFor(client)
+
+    const query = renderHook(() => useAssignmentConflicts(7, [5, 6]), { wrapper })
+    await waitFor(() => expect(query.result.current.isSuccess).toBe(true))
+
+    const { result } = renderHook(() => useRecheckAssignmentConflicts(7), { wrapper })
+    act(() => result.current())
+
+    // The set of ids the picker last asked about is not knowable from the
+    // unassignment, so the prefix is invalidated rather than one exact key.
+    await waitFor(() => expect(apiService.assignments.check).toHaveBeenCalledTimes(2))
+    // A different schedule's answers are untouched — a broad ['schedules']
+    // prefix would sweep them up.
+    client.setQueryData(queryKeys.schedules.assignmentCheck(9, [5, 6]), [])
+    act(() => result.current())
+    expect(client.getQueryState(queryKeys.schedules.assignmentCheck(9, [5, 6]))?.isInvalidated).toBe(false)
+  })
+
+  it('does nothing when there is no schedule to re-check', () => {
+    const client = makeClient()
+    const invalidate = vi.spyOn(client, 'invalidateQueries')
+
+    const { result } = renderHook(() => useRecheckAssignmentConflicts(null), { wrapper: wrapperFor(client) })
+    act(() => result.current())
+
+    expect(invalidate).not.toHaveBeenCalled()
   })
 })
 

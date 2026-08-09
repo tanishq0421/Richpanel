@@ -1,11 +1,18 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
-import type { ShiftDTO } from '@/api/types'
+import type { AgentConflictDTO, ScheduleConflictDTO } from '@/api/types'
 import { Button, Input, Skeleton } from '@/components/ui'
 import { ConflictBanner, EmptyState, ErrorState } from '@/components/feedback'
-import { useAgents, useScheduleAssignees } from '@/hooks/queries'
-import { useAssignAgent } from '@/hooks/mutations'
+import {
+  useAgents,
+  useAssignmentConflicts,
+  useRecheckAssignmentConflicts,
+  useScheduleAssignees,
+} from '@/hooks/queries'
+import { useAssignAgent, useUnassignAgent } from '@/hooks/mutations'
 import { useToast } from '@/context/ToastContext'
 import { userMessage } from '@/helpers/errors'
+import { hoursToHHMM } from '@/helpers/time'
+import { weekdayShort } from '@/helpers/weekday'
 import { cn } from '@/lib/cn'
 import { Modal } from './Modal'
 
@@ -15,65 +22,70 @@ export interface AssignAgentModalProps {
   scheduleId: number | null
 }
 
-/* ══════════════════════════════════════════════════════════════════════════
-   SEAM — conflict pre-check. NOT IMPLEMENTED; the API contract is unsettled.
+/**
+ * An agent the backend says cannot be assigned right now, with every schedule
+ * that blocks them. The API's own shape, unchanged — reshaping it here would
+ * mean a second definition of "conflict" to keep in step with the first.
+ */
+export type AssignmentConflict = AgentConflictDTO
 
-   The product rule is that conflicts are found and resolved *before* anything
-   is written: confirm must not assign three agents and then explain that two
-   were rejected. So `findAssignmentConflicts` runs first, and the write only
-   starts once it comes back clean.
-
-   The overlap rule itself stays in the backend domain layer. It is not
-   reimplemented here — a second copy in the UI would drift from the first, and
-   the UI copy cannot see the other schedules an agent holds anyway.
-
-   What this seam needs from the API, for a given schedule id + the selected
-   agent ids, one entry per agent that would be rejected:
-
-     - `agentId` / `agentName`     — who conflicts (name so the UI never has to
-                                     re-join against the directory)
-     - `conflictingScheduleId`     — the *other* schedule, addressable, because
-                                     resolution #1 unassigns the agent from it
-     - `conflictingScheduleName`   — how the user recognises that schedule
-     - `collidingShifts`           — the hours that actually collide (weekday +
-                                     start_hours/end_hours as floats, IST, same
-                                     shape as `ShiftDTO`), so the UI can say
-                                     *when* rather than just *that*
-
-   Once it is wired, each conflict gets two resolutions (`ConflictResolution`):
-   unassign the agent from `conflictingScheduleId`, or drop them from this
-   batch. The assignment proceeds only when every conflict has one.
-   ══════════════════════════════════════════════════════════════════════════ */
-
-export interface AssignmentConflict {
-  agentId: number
-  agentName: string
-  conflictingScheduleId: number
-  conflictingScheduleName: string
-  collidingShifts: ShiftDTO[]
-}
-
-export type ConflictResolution =
-  /** Unassign the agent from `conflictingScheduleId`, then assign them here. */
-  | 'free-the-agent'
-  /** Leave the other schedule alone; this agent drops out of the batch. */
-  | 'drop-from-batch'
-
-// TODO(conflict-precheck): replace with the real endpoint once the contract is
-// agreed. Returning `[]` means "nothing known to conflict", so today the modal
-// behaves exactly as it did before the pre-check existed.
-async function findAssignmentConflicts(_scheduleId: number, _agentIds: number[]): Promise<AssignmentConflict[]> {
-  return []
-}
+/**
+ * The one resolution this modal offers a control for: take the agent off the
+ * schedule that blocks them, then let the re-check unlock the row.
+ *
+ * The other resolution — leave them out of the batch — needs no control, and
+ * that is the whole design change here. Conflicts are answered *before* the
+ * write by making the row unselectable, so "drop from batch" is the default
+ * state of a conflicting row rather than a decision the user has to record.
+ */
+export type ConflictResolution = 'free-the-agent'
 
 function plural(count: number, word: string): string {
   return `${count} ${word}${count === 1 ? '' : 's'}`
 }
 
 /**
+ * "Already on Day Shift · Mon 09:00–17:00".
+ *
+ * The hours named are `existing_*` — what the agent already works — because
+ * those are the commitment the user has to go and change. Formatting goes
+ * through `hoursToHHMM`/`weekdayShort` rather than being done by hand: the wire
+ * format is a float and 9.5 is 09:30, not 09:50.
+ */
+function conflictReason(conflict: ScheduleConflictDTO): string {
+  const when = conflict.colliding_shifts
+    .map(
+      (shift) =>
+        `${weekdayShort(shift.weekday)} ${hoursToHHMM(shift.existing_start_hours)}–${hoursToHHMM(shift.existing_end_hours)}`,
+    )
+    .join(', ')
+  return when === '' ? `Already on ${conflict.schedule_name}` : `Already on ${conflict.schedule_name} · ${when}`
+}
+
+/**
  * Picking coverage is a set operation — "these four people work this shift" —
  * so the picker is a checkbox group, not a radio group, and one confirm covers
  * the whole set.
+ *
+ * ── Conflicts are answered before the user can pick, not after they submit ──
+ *
+ * On open, the modal asks the backend which of the assignable agents it would
+ * refuse (`useAssignmentConflicts`). Those rows render disabled, with the
+ * reason beside them, so an agent who cannot be assigned is never a tick the
+ * user has to take back. The overlap rule itself stays in the backend domain
+ * layer — the client cannot see the other schedules an agent holds, and a
+ * second copy of the rule would drift from the first.
+ *
+ * The list is held behind a skeleton until that first answer lands. A list that
+ * is interactive for half a second and then disables three rows under the
+ * user's cursor is worse than a list that arrives a moment later.
+ *
+ * The check is advisory: it writes nothing, and the other schedule can change
+ * between the check and the write. So `assign` can still answer 409 and that
+ * path is kept exactly as it was — the pre-check narrows the window, it does
+ * not close it.
+ *
+ * ── The write ──
  *
  * The API assigns one agent at a time (`POST /schedules/{id}/agents`), so a set
  * of four is four requests. They run **sequentially**, not concurrently:
@@ -92,31 +104,34 @@ function plural(count: number, word: string): string {
  *  3. Requests go out in list order, so anything reported afterwards reads in
  *     the same order as the list the user just ticked.
  *
- * With the pre-check in front of it, a rejection *during* the write is either a
- * race (someone else edited the other schedule in the last second) or a genuine
- * fault. Either way the batch stops there rather than pressing on: the user's
- * picture of who is covered is already stale, and the honest thing is to say so
- * and let them look again.
+ * A rejection *during* the write is now either a race or a genuine fault.
+ * Either way the batch stops there rather than pressing on: the user's picture
+ * of who is covered is already stale, and the honest thing is to say so and let
+ * them look again.
  *
  * Already-assigned agents are filtered out rather than shown as disabled rows:
  * they are not a decision the user has to make, and hiding them keeps the list
- * short enough to scan.
+ * short enough to scan. A *conflicting* agent is the opposite — it is exactly a
+ * decision, so it stays on screen with a way out.
  */
 export function AssignAgentModal({ open, onOpenChange, scheduleId }: AssignAgentModalProps) {
   const { toast } = useToast()
   const agents = useAgents()
   const assignees = useScheduleAssignees(open ? scheduleId : null)
   const assign = useAssignAgent()
+  const unassign = useUnassignAgent()
 
   const [search, setSearch] = useState('')
   const [selectedIds, setSelectedIds] = useState<number[]>([])
-  const [conflicts, setConflicts] = useState<AssignmentConflict[]>([])
   const [problem, setProblem] = useState<string | null>(null)
   // Assignments this batch already landed. The assignees query is invalidated
   // on every success, but until it comes back the list would still offer people
   // who are on the schedule now — and re-picking them earns a 409.
   const [assignedNow, setAssignedNow] = useState<number[]>([])
   const [isAssigning, setIsAssigning] = useState(false)
+  // Which (agent, other schedule) pair is being freed right now, so one row can
+  // show progress without every other Free button spinning with it.
+  const [freeing, setFreeing] = useState<{ agentId: number; scheduleId: number } | null>(null)
 
   const listRef = useRef<HTMLDivElement>(null)
 
@@ -126,10 +141,10 @@ export function AssignAgentModal({ open, onOpenChange, scheduleId }: AssignAgent
     if (open) {
       setSearch('')
       setSelectedIds([])
-      setConflicts([])
       setProblem(null)
       setAssignedNow([])
       setIsAssigning(false)
+      setFreeing(null)
     }
   }, [open, scheduleId])
 
@@ -138,6 +153,26 @@ export function AssignAgentModal({ open, onOpenChange, scheduleId }: AssignAgent
     const taken = new Set([...(assignees.data ?? []).map((a) => a.id), ...assignedNow])
     return (agents.data ?? []).filter((agent) => !taken.has(agent.id))
   }, [agents.data, assignees.data, assignedNow])
+
+  const directoryReady = !agents.isLoading && !assignees.isLoading && !agents.isError && !assignees.isError
+
+  /**
+   * The check is asked about *every* assignable agent, not just the ticked
+   * ones — its answer is what decides whether a row can be ticked at all, so
+   * asking per selection would be circular. Held at `[]` until the directory
+   * has settled so the question is asked once, with the final set.
+   */
+  const checkIds = useMemo(
+    () => (directoryReady ? available.map((agent) => agent.id) : []),
+    [directoryReady, available],
+  )
+  const conflicts = useAssignmentConflicts(open ? scheduleId : null, checkIds)
+  const recheck = useRecheckAssignmentConflicts(open ? scheduleId : null)
+
+  const conflictByAgent = useMemo(
+    () => new Map((conflicts.data ?? []).map((conflict) => [conflict.agent_id, conflict])),
+    [conflicts.data],
+  )
 
   /** What the list actually renders. Selection survives filtering: hiding a row
    *  is a view concern and must not silently drop someone from the batch. */
@@ -150,14 +185,36 @@ export function AssignAgentModal({ open, onOpenChange, scheduleId }: AssignAgent
     )
   }, [available, search])
 
-  const isLoading = agents.isLoading || assignees.isLoading
+  // `conflicts.isLoading` is the FIRST fetch only — `keepPreviousData` keeps
+  // `isPending` false on every later one — so a re-check never throws the user
+  // back to a skeleton, but the opening one does hold the list back.
+  const isLoading = agents.isLoading || assignees.isLoading || conflicts.isLoading
   const failed = agents.isError || assignees.isError
 
   const selected = useMemo(() => new Set(selectedIds), [selectedIds])
-  const allFilteredSelected = filtered.length > 0 && filtered.every((agent) => selected.has(agent.id))
-  const anyFilteredSelected = filtered.some((agent) => selected.has(agent.id))
+
+  /** Rows the user is allowed to tick. Everything downstream — the count, the
+   *  confirm label, select-all, the batch — is derived from this, never from
+   *  `selectedIds` directly, so a conflict that appears after a tick cannot
+   *  leak into the write. */
+  const selectableFiltered = useMemo(
+    () => filtered.filter((agent) => !conflictByAgent.has(agent.id)),
+    [filtered, conflictByAgent],
+  )
+  const allFilteredSelected =
+    selectableFiltered.length > 0 && selectableFiltered.every((agent) => selected.has(agent.id))
+  const anyFilteredSelected = selectableFiltered.some((agent) => selected.has(agent.id))
+
+  const count = useMemo(
+    () => selectedIds.filter((id) => !conflictByAgent.has(id)).length,
+    [selectedIds, conflictByAgent],
+  )
 
   function toggle(agentId: number) {
+    // The checkbox is already `disabled`, so this is unreachable by pointer or
+    // keyboard. It is here because "cannot be selected" is a rule, and a rule
+    // that lives only in a DOM attribute is one refactor from being gone.
+    if (conflictByAgent.has(agentId)) return
     setSelectedIds((current) =>
       current.includes(agentId) ? current.filter((id) => id !== agentId) : [...current, agentId],
     )
@@ -166,7 +223,7 @@ export function AssignAgentModal({ open, onOpenChange, scheduleId }: AssignAgent
   function selectAllFiltered() {
     setSelectedIds((current) => [
       ...current,
-      ...filtered.filter((agent) => !current.includes(agent.id)).map((agent) => agent.id),
+      ...selectableFiltered.filter((agent) => !current.includes(agent.id)).map((agent) => agent.id),
     ])
   }
 
@@ -176,15 +233,47 @@ export function AssignAgentModal({ open, onOpenChange, scheduleId }: AssignAgent
   }
 
   /* Native checkboxes are Tab-navigable but not arrow-navigable, and a long
-     directory is far quicker to walk with the arrows. Tab still works. */
+     directory is far quicker to walk with the arrows. Tab still works.
+     `:not(:disabled)` keeps conflicting rows out of the walk — they are not a
+     selection target, and stopping on one would offer a tick that never lands.
+     Their Free button is still a plain button on the Tab order. */
   function handleListKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
-    const boxes = Array.from(listRef.current?.querySelectorAll<HTMLInputElement>('input[type="checkbox"]') ?? [])
+    const boxes = Array.from(
+      listRef.current?.querySelectorAll<HTMLInputElement>('input[type="checkbox"]:not(:disabled)') ?? [],
+    )
     const index = boxes.indexOf(document.activeElement as HTMLInputElement)
     if (index === -1) return
     event.preventDefault()
     const next = event.key === 'ArrowDown' ? index + 1 : index - 1
     boxes[(next + boxes.length) % boxes.length]?.focus()
+  }
+
+  /**
+   * Resolution #1: take the agent off the schedule that blocks them.
+   *
+   * The row is NOT unlocked here. The check is the only source of truth for who
+   * conflicts — the agent may well be on a third schedule that also collides —
+   * so the invalidation is the whole of the update and the row changes when the
+   * backend answers again.
+   */
+  function handleFree(agentId: number, agentName: string, other: ScheduleConflictDTO) {
+    if (freeing !== null || isAssigning) return
+    setFreeing({ agentId, scheduleId: other.schedule_id })
+    setProblem(null)
+    unassign.mutate(
+      { scheduleId: other.schedule_id, agentId },
+      {
+        onSuccess: () => {
+          setFreeing(null)
+          recheck()
+        },
+        onError: (error) => {
+          setFreeing(null)
+          setProblem(`${agentName} could not be taken off ${other.schedule_name}: ${userMessage(error)}`)
+        },
+      },
+    )
   }
 
   /** Resolves rather than rejects, so the caller can stop the batch cleanly
@@ -202,39 +291,27 @@ export function AssignAgentModal({ open, onOpenChange, scheduleId }: AssignAgent
   }
 
   async function handleConfirm() {
-    if (scheduleId === null || selectedIds.length === 0 || isAssigning) return
+    if (scheduleId === null || count === 0 || isAssigning) return
 
     // Snapshotted before the first request: the list re-derives as each success
     // invalidates the assignees query, and this must keep naming the people the
-    // user actually picked.
-    const batch = available.filter((agent) => selected.has(agent.id))
+    // user actually picked. Conflicting agents are excluded again here — they
+    // are already unselectable, and the write is the last place to find out.
+    const batch = available.filter((agent) => selected.has(agent.id) && !conflictByAgent.has(agent.id))
     if (batch.length === 0) return
 
     setIsAssigning(true)
-    setConflicts([])
     setProblem(null)
-
-    // ── Nothing is written until the pre-check comes back clean. ────────────
-    const found = await findAssignmentConflicts(
-      scheduleId,
-      batch.map((agent) => agent.id),
-    )
-    if (found.length > 0) {
-      // TODO(conflict-precheck): this is where the resolution step attaches —
-      // per conflict, "free the agent" (unassign from `conflictingScheduleId`)
-      // or "drop from batch". Until it exists the batch simply does not run, so
-      // a wired-up endpoint can never silently write through an unresolved
-      // conflict.
-      setConflicts(found)
-      setIsAssigning(false)
-      return
-    }
 
     const assigned: typeof batch = []
 
     for (const agent of batch) {
       const outcome = await assignOne(scheduleId, agent.id)
       if (!outcome.ok) {
+        // The pre-check said this was clear, so a rejection here is a race:
+        // someone edited the other schedule in the last second. It stays an
+        // inline message rather than a fault — it is an expected answer, just a
+        // rarer one now.
         setIsAssigning(false)
         setAssignedNow((current) => [...current, ...assigned.map((a) => a.id)])
         // Whoever already landed is assigned — drop them from the selection so
@@ -266,8 +343,6 @@ export function AssignAgentModal({ open, onOpenChange, scheduleId }: AssignAgent
     onOpenChange(false)
   }
 
-  const count = selectedIds.length
-
   return (
     <Modal
       open={open}
@@ -293,16 +368,6 @@ export function AssignAgentModal({ open, onOpenChange, scheduleId }: AssignAgent
       <div className="flex flex-col gap-3">
         {problem && <ConflictBanner message={problem} onDismiss={() => setProblem(null)} />}
 
-        {/* TODO(conflict-precheck): the two resolution controls hang off each of
-            these rows once the contract lands. Listing them unresolved is the
-            deliberate holding state — the batch is blocked, not written. */}
-        {conflicts.map((conflict) => (
-          <ConflictBanner
-            key={conflict.agentId}
-            message={`${conflict.agentName} is already on "${conflict.conflictingScheduleName}" during these hours.`}
-          />
-        ))}
-
         <Input
           label="Find an agent"
           placeholder="Name or email"
@@ -312,7 +377,7 @@ export function AssignAgentModal({ open, onOpenChange, scheduleId }: AssignAgent
         />
 
         {isLoading && (
-          <div className="flex flex-col gap-2" aria-busy="true">
+          <div className="flex flex-col gap-2" aria-busy="true" aria-label="Checking for overlapping schedules">
             <Skeleton className="h-10 w-full" />
             <Skeleton className="h-10 w-full" />
             <Skeleton className="h-10 w-full" />
@@ -327,6 +392,23 @@ export function AssignAgentModal({ open, onOpenChange, scheduleId }: AssignAgent
               if (assignees.isError) void assignees.refetch()
             }}
           />
+        )}
+
+        {/* The check failing must not block the picker: it is advisory, and the
+            409 on write is still there. Say the guard is down rather than
+            pretending everyone is clear. */}
+        {!isLoading && !failed && conflicts.isError && (
+          <div
+            role="status"
+            className="flex items-center gap-2 rounded-[var(--radius-md)] border border-[var(--color-impact)]/30 bg-[var(--color-impact-bg)] px-3 py-2 text-[13px] text-[var(--color-impact)]"
+          >
+            <span className="flex-1">
+              Could not check for overlapping schedules. Assignments may still be rejected.
+            </span>
+            <Button size="sm" variant="ghost" onClick={() => void conflicts.refetch()}>
+              Try again
+            </Button>
+          </div>
         )}
 
         {!isLoading && !failed && filtered.length === 0 && (
@@ -353,7 +435,7 @@ export function AssignAgentModal({ open, onOpenChange, scheduleId }: AssignAgent
                   size="sm"
                   variant="ghost"
                   onClick={selectAllFiltered}
-                  disabled={isAssigning || allFilteredSelected}
+                  disabled={isAssigning || selectableFiltered.length === 0 || allFilteredSelected}
                 >
                   Select all
                 </Button>
@@ -376,33 +458,98 @@ export function AssignAgentModal({ open, onOpenChange, scheduleId }: AssignAgent
               className="max-h-[280px] overflow-y-auto rounded-[var(--radius-md)] border border-[var(--color-hairline)]"
             >
               {filtered.map((agent) => {
-                const isSelected = selected.has(agent.id)
+                const conflict = conflictByAgent.get(agent.id)
+                const isSelected = conflict === undefined && selected.has(agent.id)
+                const inputId = `assign-agent-${agent.id}`
+                const reasonId = (other: ScheduleConflictDTO) => `${inputId}-reason-${other.schedule_id}`
 
                 return (
-                  <label
+                  <div
                     key={agent.id}
                     data-selected={isSelected || undefined}
+                    data-conflict={conflict !== undefined || undefined}
                     className={cn(
-                      'flex cursor-pointer items-center gap-3 border-b border-[var(--color-hairline)] px-3 py-2.5 last:border-b-0',
-                      isSelected ? 'bg-[var(--color-brand-100)]' : 'hover:bg-[var(--color-surface-sunken)]',
+                      'flex items-center gap-3 border-b border-[var(--color-hairline)] px-3 py-2.5 last:border-b-0',
+                      // The tint is a hint, not the message: the row is also
+                      // marked by a rule down its left edge, an icon, and the
+                      // reason in words, so nothing here depends on seeing red.
+                      conflict
+                        ? 'border-l-2 border-l-[var(--color-conflict)] bg-[var(--color-conflict-bg)] pl-[10px]'
+                        : isSelected
+                          ? 'bg-[var(--color-brand-100)]'
+                          : 'hover:bg-[var(--color-surface-sunken)]',
                     )}
                   >
                     {/* A native checkbox, so "selected" is in the accessibility
-                        tree as a checked state rather than as a colour. */}
+                        tree as a checked state rather than as a colour — and so
+                        `disabled` genuinely removes it from the tab order
+                        rather than just looking inert. */}
                     <input
+                      id={inputId}
                       type="checkbox"
-                      className="size-4 accent-[var(--color-brand)]"
+                      className="size-4 shrink-0 accent-[var(--color-brand)] disabled:cursor-not-allowed"
                       checked={isSelected}
-                      disabled={isAssigning}
+                      disabled={isAssigning || conflict !== undefined}
+                      aria-disabled={conflict !== undefined || undefined}
+                      aria-describedby={
+                        conflict ? conflict.conflicts.map(reasonId).join(' ') || undefined : undefined
+                      }
                       onChange={() => toggle(agent.id)}
                     />
-                    <span className="min-w-0">
+                    <label
+                      htmlFor={inputId}
+                      className={cn('min-w-0 flex-1', conflict ? 'cursor-not-allowed' : 'cursor-pointer')}
+                    >
                       <span className="block truncate text-[14px] text-[var(--color-ink-900)]">{agent.name}</span>
                       {agent.email && (
                         <span className="block truncate text-[12px] text-[var(--color-ink-500)]">{agent.email}</span>
                       )}
-                    </span>
-                  </label>
+                    </label>
+
+                    {conflict && (
+                      <div className="flex shrink-0 flex-col items-end gap-1">
+                        {conflict.conflicts.map((other) => {
+                          const isFreeing =
+                            freeing?.agentId === agent.id && freeing.scheduleId === other.schedule_id
+
+                          return (
+                            <div key={other.schedule_id} className="flex items-center gap-2">
+                              <svg
+                                className="size-3.5 shrink-0 text-[var(--color-conflict)]"
+                                viewBox="0 0 16 16"
+                                fill="none"
+                                aria-hidden="true"
+                                focusable="false"
+                              >
+                                <path d="M8 4.5v4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+                                <circle cx="8" cy="11.25" r="0.9" fill="currentColor" />
+                                <circle cx="8" cy="8" r="6.75" stroke="currentColor" strokeWidth="1.3" />
+                              </svg>
+                              {/* Read out with the checkbox via
+                                  `aria-describedby`, so the row announces both
+                                  that it is unavailable and why. */}
+                              <span
+                                id={reasonId(other)}
+                                className="tabular text-[12px] text-[var(--color-conflict)]"
+                              >
+                                {conflictReason(other)}
+                              </span>
+                              <Button
+                                size="sm"
+                                variant="secondary"
+                                loading={isFreeing}
+                                disabled={isAssigning || (freeing !== null && !isFreeing)}
+                                aria-label={`Free ${agent.name} from ${other.schedule_name}`}
+                                onClick={() => handleFree(agent.id, agent.name, other)}
+                              >
+                                Free
+                              </Button>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </div>
                 )
               })}
             </div>

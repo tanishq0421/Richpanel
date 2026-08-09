@@ -46,6 +46,52 @@ export interface DeletionImpactDTO {
   affected_agent_ids: number[]
 }
 
+// ── Assignment conflict pre-check ──────────────────────────────────────────
+
+/**
+ * One weekday on which the agent's existing shift and the shift this schedule
+ * would add overlap. Both pairs are hours-as-floats, the same convention as
+ * `ShiftDTO` — 22.5 is 22:30.
+ *
+ * `existing_*` is what the agent already works elsewhere, which is the pair
+ * worth showing: it names the commitment the user has to go and change.
+ */
+export interface CollidingShiftDTO {
+  weekday: Weekday
+  existing_start_hours: number
+  existing_end_hours: number
+  new_start_hours: number
+  new_end_hours: number
+}
+
+/** The *other* schedule holding the agent, addressable so the UI can offer to
+ *  unassign them from it. */
+export interface ScheduleConflictDTO {
+  schedule_id: number
+  schedule_name: string
+  colliding_shifts: CollidingShiftDTO[]
+}
+
+/** `agent_name` is carried so the UI never has to re-join against the
+ *  directory to say who is blocked. One agent can be blocked by several
+ *  schedules at once, hence the list. */
+export interface AgentConflictDTO {
+  agent_id: number
+  agent_name: string
+  conflicts: ScheduleConflictDTO[]
+}
+
+/**
+ * Response of `POST /schedules/{id}/agents/check`. Agents ABSENT from
+ * `conflicts` are assignable.
+ *
+ * The check writes nothing and is advisory: state can change between the check
+ * and the write, so `assign` can still answer 409.
+ */
+export interface AssignmentCheckDTO {
+  conflicts: AgentConflictDTO[]
+}
+
 /**
  * Note the report carries `agent_id` but NOT the agent's name — the client
  * joins against the agents list. See `useReportRows`.

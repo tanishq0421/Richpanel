@@ -1,5 +1,6 @@
 export { useAgents } from './useAgents'
 export { useAgentSchedules } from './useAgentSchedules'
+export { useAssignmentConflicts, useRecheckAssignmentConflicts } from './useAssignmentConflicts'
 export { useDeletionImpact } from './useDeletionImpact'
 export { useReport } from './useReport'
 export { useReports } from './useReports'

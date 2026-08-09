@@ -18,6 +18,12 @@ export const queryKeys = {
     detail: (id: number) => ['schedules', 'detail', id] as const,
     assignees: (id: number) => ['schedules', id, 'assignees'] as const,
     deletionImpact: (id: number) => ['schedules', id, 'deletion-impact'] as const,
+    /** Prefix over every conflict pre-check for this schedule, whatever agent
+     *  set was asked about. Freeing an agent from *another* schedule falsifies
+     *  all of them, and it cannot know which set the picker last asked for. */
+    assignmentChecks: (id: number) => ['schedules', id, 'assignment-check'] as const,
+    assignmentCheck: (id: number, agentIds: number[]) =>
+      ['schedules', id, 'assignment-check', agentIds] as const,
   },
   reports: {
     all: ['reports'] as const,

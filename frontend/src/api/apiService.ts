@@ -2,6 +2,7 @@ import { query, request } from './http'
 import type {
   AgentDTO,
   AgentSummaryDTO,
+  AssignmentCheckDTO,
   DeletionImpactDTO,
   PaginationParams,
   ReportDTO,
@@ -48,6 +49,21 @@ class ApiService {
 
   readonly assignments = {
     listAssignees: (scheduleId: number) => request<AgentSummaryDTO[]>(`/api/v1/schedules/${scheduleId}/agents`),
+
+    /**
+     * Which of these agents could NOT be assigned to this schedule right now,
+     * and why. Writes nothing — a POST only because the agent id list is
+     * unbounded and does not belong in a query string.
+     *
+     * Advisory, not a gate: the answer can go stale between this call and the
+     * write, so `assign` still has to handle its own 409. 404 when the schedule
+     * does not exist.
+     */
+    check: (scheduleId: number, agentIds: number[]) =>
+      request<AssignmentCheckDTO>(`/api/v1/schedules/${scheduleId}/agents/check`, {
+        method: 'POST',
+        body: JSON.stringify({ agent_ids: agentIds }),
+      }),
 
     /** 409 when the agent's hours would overlap another of their schedules,
      *  or when they are already assigned here. */
