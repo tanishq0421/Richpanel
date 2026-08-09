@@ -58,6 +58,34 @@ function indexForTypeahead(buffer: string): number {
   return -1
 }
 
+/**
+ * The last row a bounded picker may reach. `OPTIONS` is ascending, so this is
+ * simply the final option at or before the ceiling — off-grid ceilings ("14:37"
+ * when the step is 15) therefore round *down* to 14:30 rather than up, which is
+ * the direction that keeps an out-of-range value from being offered.
+ *
+ * Never returns -1: 00:00 stays reachable whatever the ceiling, so the listbox
+ * is never empty and `activeIndex` always addresses a real row.
+ */
+function lastAllowedIndex(maxTime?: string): number {
+  if (!maxTime) return OPTIONS.length - 1
+
+  let ceiling: number
+  try {
+    ceiling = hhmmToHours(maxTime)
+  } catch {
+    // An unparseable bound is dropped rather than obeyed: silently offering
+    // nothing but midnight would be a far stranger failure than no bound.
+    return OPTIONS.length - 1
+  }
+
+  let last = 0
+  OPTIONS.forEach((option, index) => {
+    if (hhmmToHours(option) <= ceiling) last = index
+  })
+  return last
+}
+
 function ClockIcon() {
   return (
     <svg
@@ -81,6 +109,14 @@ export interface TimePickerProps {
   'aria-label'?: string
   id?: string
   disabled?: boolean
+  /**
+   * Latest wall-clock time this picker may offer, `HH:MM`. Later options are
+   * still rendered — struck through and `aria-disabled`, the same treatment the
+   * calendar gives an out-of-range day — but they cannot be clicked, cannot be
+   * reached by arrow/End/PageDown/typeahead, and are explained by a note the
+   * listbox is described by. Omit for an unbounded day.
+   */
+  maxTime?: string
 }
 
 /**
@@ -101,6 +137,7 @@ export function TimePicker({
   'aria-label': ariaLabel,
   id,
   disabled,
+  maxTime,
 }: TimePickerProps) {
   const generatedId = useId()
   const triggerId = id ?? `time-${generatedId}`
@@ -108,7 +145,12 @@ export function TimePicker({
   const messageId = `${triggerId}-message`
   const valueId = `${triggerId}-value`
   const listboxId = `${triggerId}-listbox`
+  const noteId = `${triggerId}-bound`
   const optionId = (index: number) => `${triggerId}-option-${index}`
+
+  // Recomputed every render rather than memoised: `maxTime` follows the clock,
+  // so a stale bound is the one failure mode worth ruling out. 96 comparisons.
+  const maxIndex = lastAllowedIndex(maxTime)
 
   const [open, setOpen] = useState(false)
   const [activeIndex, setActiveIndex] = useState(() => indexForValue(value))
@@ -126,18 +168,21 @@ export function TimePicker({
   function handleOpenChange(next: boolean) {
     setOpen(next)
     if (next) {
-      setActiveIndex(indexForValue(value))
+      // A value that has since fallen out of range (the clock moved on under an
+      // open tab) still has to open on a real row — the last one allowed.
+      setActiveIndex(Math.min(indexForValue(value), maxIndex))
       typeahead.current = { buffer: '', at: 0 }
     }
   }
 
   function commit(index: number) {
+    if (index > maxIndex) return
     onChange(OPTIONS[index])
     setOpen(false)
   }
 
   function move(delta: number) {
-    setActiveIndex((current) => Math.min(OPTIONS.length - 1, Math.max(0, current + delta)))
+    setActiveIndex((current) => Math.min(maxIndex, Math.max(0, current + delta)))
   }
 
   function handleListKeyDown(event: KeyboardEvent<HTMLDivElement>) {
@@ -159,7 +204,7 @@ export function TimePicker({
         return setActiveIndex(0)
       case 'End':
         event.preventDefault()
-        return setActiveIndex(OPTIONS.length - 1)
+        return setActiveIndex(maxIndex)
       case 'Enter':
       case ' ':
         event.preventDefault()
@@ -178,8 +223,10 @@ export function TimePicker({
         : typeahead.current.buffer + event.key
     typeahead.current = { buffer, at: now }
 
+    // Typing "22" when only up to 14:30 is available must not land on a row the
+    // user cannot then select — the keystroke is simply ignored.
     const found = indexForTypeahead(buffer)
-    if (found !== -1) {
+    if (found !== -1 && found <= maxIndex) {
       event.preventDefault()
       setActiveIndex(found)
     }
@@ -250,28 +297,52 @@ export function TimePicker({
               tabIndex={-1}
               aria-label={ariaLabel ?? label ?? 'Time'}
               aria-activedescendant={optionId(activeIndex)}
+              aria-describedby={maxTime ? noteId : undefined}
               onKeyDown={handleListKeyDown}
               className="max-h-64 w-[132px] overflow-y-auto outline-none"
             >
-              {OPTIONS.map((option, index) => (
-                <div
-                  key={option}
-                  id={optionId(index)}
-                  role="option"
-                  aria-selected={option === value}
-                  data-active={index === activeIndex || undefined}
-                  onClick={() => commit(index)}
-                  className={cn(
-                    'tabular cursor-pointer rounded-[var(--radius-md)] px-3 py-1.5 text-[13px] text-[var(--color-ink-900)]',
-                    index === activeIndex &&
-                      'bg-[var(--color-brand-100)] ring-1 ring-[var(--color-brand)] ring-inset',
-                    option === value && 'bg-[var(--color-brand)] font-semibold text-white',
-                  )}
-                >
-                  {option}
-                </div>
-              ))}
+              {OPTIONS.map((option, index) => {
+                const outOfRange = index > maxIndex
+                return (
+                  <div
+                    key={option}
+                    id={optionId(index)}
+                    role="option"
+                    aria-selected={option === value}
+                    /* Announced as unavailable rather than removed: the shape of
+                       the day stays intact, so "17:00 is missing" reads as
+                       "17:00 hasn't happened yet" instead of as a broken list. */
+                    aria-disabled={outOfRange || undefined}
+                    data-active={index === activeIndex || undefined}
+                    onClick={() => commit(index)}
+                    className={cn(
+                      'tabular rounded-[var(--radius-md)] px-3 py-1.5 text-[13px]',
+                      /* Matching the calendar's disabled day: ink-500 at full
+                         strength for contrast, with the strike-through carrying
+                         the unavailability so it is not colour alone. */
+                      outOfRange
+                        ? 'cursor-not-allowed text-[var(--color-ink-500)] line-through'
+                        : 'cursor-pointer text-[var(--color-ink-900)]',
+                      !outOfRange &&
+                        index === activeIndex &&
+                        'bg-[var(--color-brand-100)] ring-1 ring-[var(--color-brand)] ring-inset',
+                      !outOfRange && option === value && 'bg-[var(--color-brand)] font-semibold text-white',
+                    )}
+                  >
+                    {option}
+                  </div>
+                )
+              })}
             </div>
+
+            {maxTime && (
+              <p
+                id={noteId}
+                className="mt-1 border-t border-[var(--color-hairline)] px-2 pt-1.5 text-[12px] text-[var(--color-ink-500)]"
+              >
+                Later than {maxTime} hasn’t happened yet.
+              </p>
+            )}
           </Popover.Content>
         </Popover.Portal>
       </Popover.Root>

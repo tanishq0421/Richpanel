@@ -3,13 +3,14 @@ import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import type { ReactElement } from 'react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ApiError } from '@/api/http'
 import type { ReportDTO, ScheduleDTO } from '@/api/types'
 import { toIsoDate } from '@/helpers/time'
 
 import { AgentHoursTable } from './reports/AgentHoursTable'
+import { ReportForm } from './reports/ReportForm'
 import { SchedulesPage } from './schedules/SchedulesPage'
 
 /**
@@ -33,9 +34,21 @@ const h = vi.hoisted(() => {
     /* Day-of-month overflow normalises, so this stays a real local date. */
     later: new Date(now.getFullYear(), now.getMonth(), now.getDate() + 30),
     stamp: (d: Date) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`,
+    clock: (d: Date) =>
+      `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`,
+    /* The report suite pins the clock instead of reading it, so its days are
+       fixed rather than derived from `now` — a report window is judged against
+       the current minute, and a wall-clock-dependent fixture would pass or fail
+       on the hour CI happened to run. 14:37 is off the 15-minute grid on
+       purpose: the ceiling floors to 14:30. */
+    reportNow: new Date(2025, 2, 10, 14, 37),
+    reportToday: new Date(2025, 2, 10),
+    reportYesterday: new Date(2025, 2, 9),
+    reportTomorrow: new Date(2025, 2, 11),
     /** Lets a test assert the mutation was never reached, not just that a
         message appeared. */
     createMutate: vi.fn(),
+    generateMutate: vi.fn(),
     state: {
       schedules: stub([]),
       schedule: stub(undefined),
@@ -46,6 +59,8 @@ const h = vi.hoisted(() => {
       reportRows: [] as { agentId: number; agentName: string; businessSeconds: number }[],
       createError: null as unknown,
       created: { id: 7 } as unknown,
+      generateError: null as unknown,
+      generated: { id: 4 } as unknown,
     },
   }
 })
@@ -93,7 +108,24 @@ vi.mock('@/hooks/mutations', async (importOriginal) => {
     useUnassignAgent: inert,
     useAssignAgent: inert,
     useDeleteSchedule: inert,
-    useGenerateReport: inert,
+    // Stateful for the same reason as create: a 422 has to re-render the form
+    // still holding what the user chose, which is the point of the 422 tests.
+    useGenerateReport: () => {
+      const [error, setError] = useState<unknown>(null)
+      return {
+        error,
+        isPending: false,
+        reset: () => setError(null),
+        mutate: (input: unknown, options?: { onSuccess?: (report: unknown) => void }) => {
+          h.generateMutate(input)
+          if (h.state.generateError) {
+            setError(h.state.generateError)
+            return
+          }
+          options?.onSuccess?.(h.state.generated)
+        },
+      }
+    },
   }
 })
 
@@ -106,8 +138,54 @@ vi.mock('@/hooks/mutations', async (importOriginal) => {
  * `value` and `minDate` are rendered as text so a test can assert what each
  * field actually holds and what floor it was handed, rather than inferring it.
  */
+/**
+ * Deliberately a *dumb* double: it neither bounds its options nor pulls a
+ * stranded time back, so anything the report form is asserted to catch here it
+ * catches on its own. The real bounding and clamping is the DateTimeField's,
+ * and is covered in `components/datetime/datetime.test.tsx`.
+ *
+ * `max` is rendered as text so a test can assert the ceiling the form handed
+ * down, and the error is prefixed with the field's label so a test can tell
+ * *which* control a 422 landed on rather than merely that it appeared.
+ */
 vi.mock('@/components/datetime', () => ({
-  DateTimeField: () => null,
+  DateTimeField: ({
+    date,
+    time,
+    onChange,
+    label,
+    error,
+    max,
+  }: {
+    date: Date | null
+    time: string
+    onChange: (v: { date: Date | null; time: string }) => void
+    label?: string
+    error?: string
+    max?: Date
+  }) => (
+    <div>
+      <span>{`${label} = ${date ? h.stamp(date) : 'empty'} ${time}`}</span>
+      <span>{`${label} ceiling ${max ? `${h.stamp(max)} ${h.clock(max)}` : 'none'}`}</span>
+      <button type="button" onClick={() => onChange({ date: h.reportToday, time })}>
+        {`set ${label} today`}
+      </button>
+      <button type="button" onClick={() => onChange({ date: h.reportYesterday, time })}>
+        {`set ${label} yesterday`}
+      </button>
+      {/* Stands in for state that went stale under an open tab — the real
+          calendar no longer offers a day after today. */}
+      <button type="button" onClick={() => onChange({ date: h.reportTomorrow, time })}>
+        {`set ${label} tomorrow`}
+      </button>
+      {['08:00', '12:00', '23:45'].map((option) => (
+        <button key={option} type="button" onClick={() => onChange({ date, time: option })}>
+          {`set ${label} ${option}`}
+        </button>
+      ))}
+      {error ? <span>{`${label} error: ${error}`}</span> : null}
+    </div>
+  ),
   DateRangePicker: () => null,
   DatePicker: ({
     value,
@@ -180,7 +258,10 @@ beforeEach(() => {
   h.state.reportRows = []
   h.state.createError = null
   h.state.created = { id: 7 }
+  h.state.generateError = null
+  h.state.generated = { id: 4 }
   h.createMutate.mockClear()
+  h.generateMutate.mockClear()
 })
 
 describe('SchedulesPage', () => {
@@ -360,6 +441,188 @@ describe('SchedulesPage', () => {
     // Still there to be corrected, not silently discarded.
     expect(screen.getByText(`Ends = ${h.stamp(h.today)}`)).toBeInTheDocument()
     expect(h.createMutate).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * A report answers how many business hours each agent had *while a ticket was
+ * open*, so the window may not reach past now — hours nobody has worked yet,
+ * presented as history. The backend answers 422; these assert the form keeps
+ * the user out of that state and says something useful when it cannot.
+ *
+ * The clock is pinned rather than read: the rule is judged against the current
+ * minute, so a suite that used the real clock would pass or fail on the hour CI
+ * happened to run. Only `Date` is faked — user-event drives its own timers, and
+ * faking `setTimeout` here would hang every interaction.
+ */
+describe('ReportForm', () => {
+  const FUTURE_MESSAGE = "A report can't cover time that hasn't happened yet."
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(h.reportNow)
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  /** A window that closed hours ago: today 08:00 → today 12:00, both < 14:37. */
+  async function fillValidWindow(user: ReturnType<typeof userEvent.setup>) {
+    await user.click(screen.getByRole('button', { name: 'set Ticket started today' }))
+    await user.click(screen.getByRole('button', { name: 'set Ticket started 08:00' }))
+    await user.click(screen.getByRole('button', { name: 'set Ticket resolved today' }))
+    await user.click(screen.getByRole('button', { name: 'set Ticket resolved 12:00' }))
+  }
+
+  it('hands both fields now as their ceiling', () => {
+    renderPage(<ReportForm onGenerated={vi.fn()} />, '/reports')
+
+    const ceiling = `${h.stamp(h.reportNow)} ${h.clock(h.reportNow)}`
+    expect(screen.getByText(`Ticket started ceiling ${ceiling}`)).toBeInTheDocument()
+    expect(screen.getByText(`Ticket resolved ceiling ${ceiling}`)).toBeInTheDocument()
+  })
+
+  it('generates a report for a window that has already closed', async () => {
+    const user = userEvent.setup()
+    const onGenerated = vi.fn()
+    renderPage(<ReportForm onGenerated={onGenerated} />, '/reports')
+
+    await fillValidWindow(user)
+    await user.click(screen.getByRole('button', { name: 'Generate report' }))
+
+    expect(h.generateMutate).toHaveBeenCalledWith({
+      ticketStartAt: '2025-03-10T08:00:00',
+      ticketEndAt: '2025-03-10T12:00:00',
+    })
+    expect(onGenerated).toHaveBeenCalledWith({ id: 4 })
+  })
+
+  /**
+   * The pickers cannot cover this on their own: "now" moves under a tab nobody
+   * has touched, so a time chosen an hour ago can be in the future by the time
+   * Generate is pressed.
+   */
+  it('blocks a window whose end has drifted into the future', async () => {
+    const user = userEvent.setup()
+    renderPage(<ReportForm onGenerated={vi.fn()} />, '/reports')
+
+    await fillValidWindow(user)
+    await user.click(screen.getByRole('button', { name: 'set Ticket resolved 23:45' }))
+    await user.click(screen.getByRole('button', { name: 'Generate report' }))
+
+    expect(await screen.findByText(`Ticket resolved error: ${FUTURE_MESSAGE}`)).toBeInTheDocument()
+    expect(h.generateMutate).not.toHaveBeenCalled()
+  })
+
+  it('blocks a start date the calendar would no longer offer', async () => {
+    const user = userEvent.setup()
+    renderPage(<ReportForm onGenerated={vi.fn()} />, '/reports')
+
+    await fillValidWindow(user)
+    await user.click(screen.getByRole('button', { name: 'set Ticket started tomorrow' }))
+    await user.click(screen.getByRole('button', { name: 'Generate report' }))
+
+    expect(await screen.findByText(`Ticket started error: ${FUTURE_MESSAGE}`)).toBeInTheDocument()
+    expect(h.generateMutate).not.toHaveBeenCalled()
+  })
+
+  /**
+   * 23:45 was legal while the date was yesterday. Moving the date to today puts
+   * it in the future — and whatever the field does about that, what must never
+   * happen is the window going to the backend still saying 23:45.
+   */
+  it('does not submit a time the date change left in the future', async () => {
+    const user = userEvent.setup()
+    renderPage(<ReportForm onGenerated={vi.fn()} />, '/reports')
+
+    await user.click(screen.getByRole('button', { name: 'set Ticket started yesterday' }))
+    await user.click(screen.getByRole('button', { name: 'set Ticket started 08:00' }))
+    await user.click(screen.getByRole('button', { name: 'set Ticket resolved yesterday' }))
+    await user.click(screen.getByRole('button', { name: 'set Ticket resolved 23:45' }))
+    // The date moves on; the time stays where it was.
+    await user.click(screen.getByRole('button', { name: 'set Ticket resolved today' }))
+    await user.click(screen.getByRole('button', { name: 'Generate report' }))
+
+    expect(await screen.findByText(`Ticket resolved error: ${FUTURE_MESSAGE}`)).toBeInTheDocument()
+    expect(h.generateMutate).not.toHaveBeenCalled()
+  })
+
+  it('still refuses a resolution that comes before the ticket started', async () => {
+    const user = userEvent.setup()
+    renderPage(<ReportForm onGenerated={vi.fn()} />, '/reports')
+
+    await user.click(screen.getByRole('button', { name: 'set Ticket started today' }))
+    await user.click(screen.getByRole('button', { name: 'set Ticket started 12:00' }))
+    await user.click(screen.getByRole('button', { name: 'set Ticket resolved today' }))
+    await user.click(screen.getByRole('button', { name: 'set Ticket resolved 08:00' }))
+    await user.click(screen.getByRole('button', { name: 'Generate report' }))
+
+    expect(
+      await screen.findByText('Ticket resolved error: Resolution must come after the ticket start.'),
+    ).toBeInTheDocument()
+    expect(h.generateMutate).not.toHaveBeenCalled()
+  })
+
+  /**
+   * The race is real: the guard passes, and the submit lands a second after the
+   * window stopped being valid. Verified against the running API — the rule is
+   * a pydantic *model* validator, so FastAPI's `loc` is `("body",)` and the
+   * detail arrives addressed to "body", not to `ticket_end_at`. It still has to
+   * reach the control it is about, in words a support manager can act on.
+   */
+  it('lands the backend 422 on the field it is about, keeping what was chosen', async () => {
+    const user = userEvent.setup()
+    h.state.generateError = new ApiError('validation', 422, 'validation_error', 'request validation failed', [
+      {
+        field: 'body',
+        message:
+          'Value error, a report window cannot extend into the future; ticket_end_at must not be later than the current time',
+        type: 'value_error',
+      },
+    ])
+
+    renderPage(<ReportForm onGenerated={vi.fn()} />, '/reports')
+    await fillValidWindow(user)
+    await user.click(screen.getByRole('button', { name: 'Generate report' }))
+
+    expect(await screen.findByText(`Ticket resolved error: ${FUTURE_MESSAGE}`)).toBeInTheDocument()
+    // The rule is about the end of the window, so the start is left alone …
+    expect(screen.queryByText(/Ticket started error/)).not.toBeInTheDocument()
+    // … and nothing the user chose is thrown away in the process.
+    expect(screen.getByText(`Ticket started = ${h.stamp(h.reportToday)} 08:00`)).toBeInTheDocument()
+    expect(screen.getByText(`Ticket resolved = ${h.stamp(h.reportToday)} 12:00`)).toBeInTheDocument()
+  })
+
+  it('surfaces a per-field 422 detail on the control that caused it', async () => {
+    const user = userEvent.setup()
+    h.state.generateError = new ApiError('validation', 422, 'validation_error', 'request validation failed', [
+      { field: 'ticket_start_at', message: 'Input should be a valid datetime', type: 'datetime_parsing' },
+    ])
+
+    renderPage(<ReportForm onGenerated={vi.fn()} />, '/reports')
+    await fillValidWindow(user)
+    await user.click(screen.getByRole('button', { name: 'Generate report' }))
+
+    expect(
+      await screen.findByText('Ticket started error: Input should be a valid datetime'),
+    ).toBeInTheDocument()
+    expect(screen.getByText(`Ticket started = ${h.stamp(h.reportToday)} 08:00`)).toBeInTheDocument()
+  })
+
+  /** A rejection nothing can be pinned to must still be said out loud — a form
+   *  that fails silently is worse than one that fails loudly. */
+  it('falls back to a banner when a failure cannot be pinned to a field', async () => {
+    const user = userEvent.setup()
+    h.state.generateError = new ApiError('server', 500, 'internal_error', 'boom')
+
+    renderPage(<ReportForm onGenerated={vi.fn()} />, '/reports')
+    await fillValidWindow(user)
+    await user.click(screen.getByRole('button', { name: 'Generate report' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'The server hit an unexpected problem. Nothing was saved.',
+    )
   })
 })
 
