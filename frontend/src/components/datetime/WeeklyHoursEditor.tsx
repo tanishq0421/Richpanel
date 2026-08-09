@@ -222,6 +222,38 @@ function spokenDuration(hours: number): string {
   return parts.length > 0 ? parts.join(' ') : '0 hours'
 }
 
+/**
+ * Does an overnight tail landing at [00:00, tailEndHours) on some weekday
+ * overlap that weekday's own, separately-configured shift [ownStart, ownEnd)?
+ *
+ * This is the client-side mirror of the backend's `find_self_overlaps` for
+ * exactly the pair it exists to catch — an overnight shift's continuation
+ * colliding with the same weekday's own window — using the same strict
+ * overlap rule (`start < otherEnd && otherStart < end`; touching at the
+ * boundary is not a collision, so a tail that ends exactly when the own shift
+ * starts is fine). `ownEnd` may itself be an overnight end (`<= ownStart`);
+ * `isOvernight` is what decides whether the own shift's portion of ITS day
+ * runs to end-of-day or stops at `ownEnd`.
+ */
+function tailOverlap(
+  tailEndHours: number,
+  ownStart: number,
+  ownEnd: number,
+): { start: number; end: number } | null {
+  const ownDayEnd = isOvernight(ownStart, ownEnd) ? 24 : ownEnd
+  const overlapEnd = Math.min(tailEndHours, ownDayEnd)
+  return ownStart < overlapEnd ? { start: ownStart, end: overlapEnd } : null
+}
+
+/**
+ * The backend rejects this combination outright (see `find_self_overlaps`) —
+ * this is what a user sees before they ever reach that 409/422. Exported so
+ * a page (or a test) can assert the exact wording without re-deriving it.
+ */
+export function selfOverlapMessage(fromWeekday: Weekday, overlapStartHours: number, overlapEndHours: number): string {
+  return `Overlaps ${weekdayLong(fromWeekday)}'s overnight shift here, ${hoursToHHMM(overlapStartHours)}–${hoursToHHMM(overlapEndHours)}. Change one of the two shifts — the server rejects this combination.`
+}
+
 interface DayRowProps {
   weekday: Weekday
   /** null when the day is not worked. Primitives, not the ShiftDTO object —
@@ -293,6 +325,21 @@ const DayRow = memo(function DayRow({
   const endHHMM = draft ? draft.end : committed ? hoursToHHMM(committed.end) : hoursToHHMM(DEFAULT_END_HOURS)
   const rowError = draft ? shiftError(draft.start, draft.end) : null
 
+  // Draft-aware, like `rowError` above: while an invalid-but-shape-valid time
+  // is being tried, the warning has to track what was just typed, not the
+  // last value that actually committed — otherwise editing the row into the
+  // collision would show nothing until the user looked away and back.
+  const effectiveStart = draft ? hhmmToHours(draft.start) : committed?.start
+  const effectiveEnd = draft ? hhmmToHours(draft.end) : committed?.end
+  const overlap =
+    !rowError &&
+    effectiveStart !== undefined &&
+    effectiveEnd !== undefined &&
+    incomingFrom !== null &&
+    incomingEndHours !== null
+      ? tailOverlap(incomingEndHours, effectiveStart, effectiveEnd)
+      : null
+
   const long = weekdayLong(weekday)
   const overnight = committed !== null && !rowError && isOvernight(committed.start, committed.end)
   const durationHours = committed !== null && !rowError ? shiftDurationHours(committed.start, committed.end) : 0
@@ -304,6 +351,16 @@ const DayRow = memo(function DayRow({
         setDraft({ start: nextStart, end: nextEnd })
         return
       }
+      // The backend genuinely rejects this shape (find_self_overlaps), so — same
+      // as the two shiftError cases above — it never reaches `onChange`. The
+      // rejected value stays visible via `draft`, with the reason under it.
+      if (incomingFrom !== null && incomingEndHours !== null) {
+        const conflict = tailOverlap(incomingEndHours, hhmmToHours(nextStart), hhmmToHours(nextEnd))
+        if (conflict) {
+          setDraft({ start: nextStart, end: nextEnd })
+          return
+        }
+      }
       setDraft(null)
       onChangeDay(weekday, {
         weekday,
@@ -311,7 +368,7 @@ const DayRow = memo(function DayRow({
         end_hours: hhmmToHours(nextEnd),
       })
     },
-    [onChangeDay, weekday],
+    [onChangeDay, weekday, incomingFrom, incomingEndHours],
   )
 
   const toggle = useCallback(() => {
@@ -334,6 +391,7 @@ const DayRow = memo(function DayRow({
     incomingFrom !== null && incomingEndHours !== null
       ? `${weekdayLong(incomingFrom)}'s shift continues until ${hoursToHHMM(incomingEndHours)}.`
       : '',
+    overlap && incomingFrom !== null ? selfOverlapMessage(incomingFrom, overlap.start, overlap.end) : '',
   ]
     .filter(Boolean)
     .join('. ')
@@ -464,6 +522,25 @@ const DayRow = memo(function DayRow({
         <p className="mt-1.5 pl-[180px] text-[12px] text-[var(--color-conflict)]" role="alert">
           {rowError}
         </p>
+      )}
+
+      {/* Distinct from `rowError` above: this row's own shape is fine on its
+          own — the collision is with ANOTHER row's overnight tail, which is
+          exactly the shape of conflict `AssignAgentModal` renders (a tinted,
+          left-ruled block with an icon), reused here for the same reason it
+          is used there — the tint is a hint, not the only signal. */}
+      {!rowError && overlap && incomingFrom !== null && (
+        <div
+          role="alert"
+          className="mt-1.5 ml-[180px] flex items-start gap-1.5 rounded-[3px] border-l-2 border-l-[var(--color-conflict)] bg-[var(--color-conflict-bg)] py-1 pr-2 pl-2 text-[12px] text-[var(--color-conflict)]"
+        >
+          <svg className="mt-0.5 size-3.5 shrink-0" viewBox="0 0 16 16" fill="none" aria-hidden="true" focusable="false">
+            <path d="M8 4.5v4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+            <circle cx="8" cy="11.25" r="0.9" fill="currentColor" />
+            <circle cx="8" cy="8" r="6.75" stroke="currentColor" strokeWidth="1.3" />
+          </svg>
+          <span>{selfOverlapMessage(incomingFrom, overlap.start, overlap.end)}</span>
+        </div>
       )}
     </div>
   )

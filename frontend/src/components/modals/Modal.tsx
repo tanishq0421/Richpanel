@@ -1,5 +1,5 @@
 import * as Dialog from '@radix-ui/react-dialog'
-import { useId, type ReactNode } from 'react'
+import { useId, useRef, type ReactNode } from 'react'
 import { cn } from '@/lib/cn'
 
 export interface ModalProps {
@@ -36,6 +36,34 @@ export function Modal({ open, onOpenChange, title, description, children, footer
   const titleId = `${baseId}-title`
   const descriptionId = `${baseId}-description`
 
+  /**
+   * Radix restores focus to whatever opened the dialog automatically — but
+   * only when Radix itself owns the trigger (`Dialog.Trigger`). Every dialog
+   * in this app is opened from state the CALLER owns instead — an
+   * `open`/`onOpenChange` pair flipped by a plain button (e.g. `setAssignOpen
+   * (true)` in `AssigneeList`) — so there is no `Dialog.Trigger` for Radix to
+   * remember. Worse, `Dialog.Content`'s own `onCloseAutoFocus` unconditionally
+   * calls `event.preventDefault()` before trying that (empty) trigger ref,
+   * which also suppresses `FocusScope`'s built-in fallback of returning focus
+   * to whatever was focused before it mounted. Net effect: closing any dialog
+   * — Escape, the X button, or an outside click — drops focus to `<body>`,
+   * stranding a keyboard-only user.
+   *
+   * Fixed once, here, so every dialog built on `Modal` inherits it: whatever
+   * has focus is captured the instant `open` turns true — read during render,
+   * before `FocusScope` mounts and moves focus into the dialog, the only
+   * point `document.activeElement` is guaranteed to still be the trigger —
+   * and handed back via `onCloseAutoFocus`, which fires once per close no
+   * matter which of the three paths caused it, superseding Radix's own
+   * (trigger-less) attempt.
+   */
+  const wasOpen = useRef(open)
+  const triggerRef = useRef<HTMLElement | null>(null)
+  if (open && !wasOpen.current) {
+    triggerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+  }
+  wasOpen.current = open
+
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
@@ -50,6 +78,10 @@ export function Modal({ open, onOpenChange, title, description, children, footer
         <Dialog.Content
           aria-labelledby={titleId}
           aria-describedby={description ? descriptionId : undefined}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault()
+            triggerRef.current?.focus()
+          }}
           className={cn(
             'fixed top-1/2 left-1/2 z-50 flex max-h-[calc(100vh-3rem)] w-[calc(100vw-2rem)] -translate-x-1/2 -translate-y-1/2 flex-col',
             'rounded-[var(--radius-lg)] border border-[var(--color-hairline)] bg-[var(--color-surface)]',

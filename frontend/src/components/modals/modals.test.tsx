@@ -16,10 +16,31 @@ import { Modal } from './Modal'
  * an answer rather than a fault — and a real client would only add timing.
  */
 const mocks = vi.hoisted(() => {
-  const idle = () => ({ data: undefined, isLoading: false, isError: false, error: null, refetch: vi.fn() })
+  // `hasNextPage`/`fetchNextPage`/`isFetchingNextPage` are useAgents's own
+  // pagination controls (see hooks/queries/useAgents.ts) -- idle by default
+  // so existing tests, which never exercise paging, see no "Load more"
+  // affordance and behave exactly as before it was added.
+  const idle = () => ({
+    data: undefined,
+    isLoading: false,
+    isSuccess: false,
+    isError: false,
+    error: null,
+    refetch: vi.fn(),
+    fetchNextPage: vi.fn(),
+    hasNextPage: false,
+    isFetchingNextPage: false,
+  })
+  const state = { agents: idle() as any, assignees: idle() as any, impact: idle() as any, conflicts: idle() as any }
   return {
-    state: { agents: idle() as any, assignees: idle() as any, impact: idle() as any, conflicts: idle() as any },
+    state,
     idle,
+    // useAgents(search) is now called with the modal's debounced search term.
+    // Every existing test sets `state.agents` and expects that exact answer
+    // back regardless of what the modal searched for, so the default here
+    // ignores the argument -- only the paging/search-specific tests below
+    // override it to answer differently per term.
+    agentsFor: vi.fn((_search: string) => state.agents),
     assignMutate: vi.fn(),
     unassignMutate: vi.fn(),
     deleteMutate: vi.fn(),
@@ -29,7 +50,7 @@ const mocks = vi.hoisted(() => {
 })
 
 vi.mock('@/hooks/queries', () => ({
-  useAgents: () => mocks.state.agents,
+  useAgents: (search: string) => mocks.agentsFor(search),
   useScheduleAssignees: () => mocks.state.assignees,
   useDeletionImpact: () => mocks.state.impact,
   useAssignmentConflicts: () => mocks.state.conflicts,
@@ -82,6 +103,10 @@ beforeEach(() => {
   mocks.state.assignees = mocks.idle()
   mocks.state.impact = mocks.idle()
   mocks.state.conflicts = mocks.idle()
+  // vi.clearAllMocks() clears call history but not a prior mockImplementation
+  // -- reset to the pass-through default so a search-aware override in one
+  // test cannot leak into the next.
+  mocks.agentsFor.mockImplementation(() => mocks.state.agents)
 })
 
 describe('Modal', () => {
@@ -137,6 +162,62 @@ describe('Modal', () => {
 
     expect(onOpenChange).toHaveBeenCalledWith(false)
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+  })
+
+  // ── Focus returns to whatever opened the dialog ─────────────────────────
+  //
+  // Every dialog in this app is opened from external state (a plain button
+  // flipping `open`), not a `Dialog.Trigger` — so Radix has no trigger of its
+  // own to remember, and its default `onCloseAutoFocus` would otherwise leave
+  // focus on `<body>` on every close path. These drive a REAL trigger button,
+  // the way a keyboard user actually reaches the dialog, and assert focus
+  // lands back on it after each of the two ways to close.
+
+  /** A page with a real trigger button, mirroring how `AssignAgentModal` is
+   *  opened from `AssigneeList`: `open` is state the trigger's own onClick
+   *  flips, not something `Modal` or Radix controls. */
+  function TriggeredHarness() {
+    const [open, setOpen] = useState(false)
+    return (
+      <>
+        <button type="button" onClick={() => setOpen(true)}>
+          Assign agent
+        </button>
+        <Modal open={open} onOpenChange={setOpen} title="Assign agents">
+          <button type="button">Inside</button>
+        </Modal>
+      </>
+    )
+  }
+
+  it('returns focus to the trigger after closing on Escape', async () => {
+    const user = userEvent.setup()
+    render(<TriggeredHarness />)
+
+    const trigger = screen.getByRole('button', { name: 'Assign agent' })
+    trigger.focus()
+    await user.click(trigger)
+    await screen.findByRole('dialog')
+
+    await user.keyboard('{Escape}')
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    expect(trigger).toHaveFocus()
+  })
+
+  it('returns focus to the trigger after closing via the visible close button', async () => {
+    const user = userEvent.setup()
+    render(<TriggeredHarness />)
+
+    const trigger = screen.getByRole('button', { name: 'Assign agent' })
+    trigger.focus()
+    await user.click(trigger)
+    await screen.findByRole('dialog')
+
+    await user.click(screen.getByRole('button', { name: 'Close' }))
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    expect(trigger).toHaveFocus()
   })
 })
 
@@ -361,6 +442,51 @@ describe('AssignAgentModal', () => {
 
     expect(checkbox(/Cyd Iyer/)).toBeInTheDocument()
     expect(screen.queryByRole('checkbox', { name: /Ana Rao/ })).toBeNull()
+  })
+
+  it('search reaches an agent that was never loaded into the current page', async () => {
+    // The whole point of server-side search: a directory of thousands is
+    // fetched a page at a time, so an agent past the first page is not in
+    // `agents.data` yet -- typing their name must still find them, because
+    // the search is answered against the WHOLE directory, not just what
+    // happens to be loaded already.
+    const user = userEvent.setup()
+    const firstPage = loaded(AGENTS)
+    const deepAgent = { id: 9001, name: 'Zed Volkov', email: 'zed@example.com' }
+    mocks.state.agents = firstPage
+    mocks.state.assignees = loaded([])
+    mocks.agentsFor.mockImplementation((search: string) =>
+      search === 'zed' ? loaded([deepAgent]) : firstPage,
+    )
+
+    render(<AssignAgentModal open onOpenChange={vi.fn()} scheduleId={7} />)
+
+    // Not on the page that loaded when the modal opened.
+    expect(screen.queryByRole('checkbox', { name: /Zed Volkov/ })).toBeNull()
+
+    await user.type(finder(), 'zed')
+
+    // Debounced: the server-scoped answer replaces the first page once
+    // typing settles.
+    await waitFor(() => expect(checkbox(/Zed Volkov/)).toBeInTheDocument(), { timeout: 2000 })
+    expect(screen.queryByRole('checkbox', { name: /Ana Rao/ })).toBeNull()
+  })
+
+  it('loads more of the directory on demand instead of capping at one page', async () => {
+    // Proves the picker has a way to reach agents beyond whatever the first
+    // page returned -- the failure mode this replaces was a hard cap with no
+    // way out at all.
+    const user = userEvent.setup()
+    const fetchNextPage = vi.fn()
+    mocks.state.agents = { ...loaded(AGENTS), hasNextPage: true, fetchNextPage }
+    mocks.state.assignees = loaded([])
+
+    render(<AssignAgentModal open onOpenChange={vi.fn()} scheduleId={7} />)
+
+    const loadMore = screen.getByRole('button', { name: /load more agents/i })
+    await user.click(loadMore)
+
+    expect(fetchNextPage).toHaveBeenCalledTimes(1)
   })
 
   it('select all takes the filtered set only, and the selection survives the filter', async () => {

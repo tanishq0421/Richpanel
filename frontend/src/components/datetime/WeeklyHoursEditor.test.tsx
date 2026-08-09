@@ -160,6 +160,66 @@ describe('WeeklyHoursEditor — overnight shifts are one shift', () => {
   })
 })
 
+describe('WeeklyHoursEditor — an overnight tail colliding with its own landing day', () => {
+  it('warns when the tail overlaps that weekday\'s own configured shift, naming the day and the window', () => {
+    // The exact case from find_self_overlaps' docstring: Sunday 22:00-06:00's
+    // tail lands on Monday 00:00-06:00, and Monday has its own 03:00-11:00.
+    render(
+      <Harness
+        initial={[
+          { weekday: 6, start_hours: 22, end_hours: 6 },
+          { weekday: 0, start_hours: 3, end_hours: 11 },
+        ]}
+      />,
+    )
+
+    const warning = screen.getByRole('alert')
+    expect(warning).toHaveTextContent("Overlaps Sunday's overnight shift here, 03:00–06:00")
+  })
+
+  it('does not warn when the continuation ends before the next day\'s own shift starts', () => {
+    render(
+      <Harness
+        initial={[
+          { weekday: 6, start_hours: 22, end_hours: 3 },
+          { weekday: 0, start_hours: 5, end_hours: 11 },
+        ]}
+      />,
+    )
+
+    expect(screen.queryByText(/overlaps sunday/i)).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('does not false-positive on an ordinary overnight shift with nothing configured on the day it lands on', () => {
+    render(<Harness initial={[{ weekday: 0, start_hours: 22, end_hours: 6 }]} />)
+
+    expect(screen.queryByText(/overlaps/i)).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('blocks committing an edit that would create the collision, leaving the typed value on screen', async () => {
+    const onChange = vi.fn()
+    render(
+      <Harness
+        onChange={onChange}
+        initial={[
+          { weekday: 6, start_hours: 22, end_hours: 6 },
+          { weekday: 0, start_hours: 9, end_hours: 17 },
+        ]}
+      />,
+    )
+
+    // Monday starts clear of Sunday's tail (9 > 6) — editing it to 03:00 would
+    // not, since 03:00 falls inside the 00:00-06:00 tail.
+    setTime('Monday start time', '03:00')
+
+    expect(onChange).not.toHaveBeenCalled()
+    expect(screen.getByLabelText('Monday start time')).toHaveValue('03:00')
+    expect(screen.getByText(/Overlaps Sunday's overnight shift here, 03:00–06:00/)).toBeInTheDocument()
+  })
+})
+
 describe('WeeklyHoursEditor — the two shapes the backend rejects', () => {
   it('blocks an end of 00:00 and suggests 23:45', () => {
     const onChange = vi.fn()
