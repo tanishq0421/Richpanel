@@ -23,3 +23,7 @@ class ResolutionReportAgentHours(Base):
     report_id: Mapped[int] = mapped_column(ForeignKey("resolution_reports.id", ondelete="CASCADE"))
     agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id"))
     business_seconds: Mapped[int]
+    # No updated_at: these rows are written once with the report and never
+    # mutated. created_at is here because every table should be able to say when
+    # a row came into existence.
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
