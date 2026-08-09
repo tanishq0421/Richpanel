@@ -5,7 +5,7 @@ seen this codebase: read section 1 before any code.
 
 ---
 
-## 1. What this is, in plain language
+## 1. Context
 
 **Richpanel is a customer-support platform for ecommerce brands.** Support
 agents answer tickets. Agents work shifts, not around the clock — so when a
