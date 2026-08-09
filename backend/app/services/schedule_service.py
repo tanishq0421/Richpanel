@@ -4,12 +4,15 @@ import time
 from dataclasses import dataclass
 from datetime import date
 
+from sqlalchemy import text
+
+from app.components.schedule_agents import queries as schedule_agents_queries
 from app.components.schedules import queries as schedules_queries
 from app.db import db_session_read, db_session_write
-from app.domain.overlap import find_self_overlaps
+from app.domain.overlap import find_overlaps, find_self_overlaps
 from app.domain.shift_normalization import normalize_shift, recombine_shifts
 from app.domain.types import ShiftInput
-from app.errors.error import NotFoundError, ScheduleOverlapError
+from app.errors.error import AssignmentOverlapError, NotFoundError, ScheduleOverlapError
 from app.services._conversions import weekday_shift_from_row
 
 logger = logging.getLogger("richpanel.schedule_service")
@@ -75,3 +78,76 @@ def list_schedules(limit: int, offset: int) -> list[ScheduleDetail]:
     with db_session_read() as session:
         schedules = schedules_queries.list_active_schedules(session, limit, offset)
         return [_to_detail(s, schedules_queries.get_weekday_hours_rows(session, s.id)) for s in schedules]
+
+
+@dataclass(frozen=True)
+class DeletionImpact:
+    schedule_id: int
+    affected_agent_ids: list[int]
+
+
+def update_schedule_hours(schedule_id: int, shift_inputs: list[ShiftInput]) -> ScheduleDetail:
+    normalized_shifts = [ws for shift in shift_inputs for ws in normalize_shift(shift)]
+
+    self_conflicts = find_self_overlaps(normalized_shifts)
+    if self_conflicts:
+        raise ScheduleOverlapError(self_conflicts)
+
+    with db_session_write() as session:
+        schedule = schedules_queries.get_schedule(session, schedule_id)
+        if schedule is None:
+            raise NotFoundError(f"schedule {schedule_id} not found")
+
+        assignee_ids = sorted(schedule_agents_queries.list_active_assignee_agent_ids(session, schedule_id))
+
+        lock_started = time.perf_counter()
+        for agent_id in assignee_ids:
+            session.execute(text("SELECT pg_advisory_xact_lock(:aid)"), {"aid": agent_id})
+        lock_wait_ms = round((time.perf_counter() - lock_started) * 1000, 2)
+
+        for agent_id in assignee_ids:
+            other_schedule_ids = schedule_agents_queries.get_other_active_schedule_ids_for_agent(
+                session, agent_id, exclude_schedule_id=schedule_id
+            )
+            existing_shifts = [
+                weekday_shift_from_row(r)
+                for other_id in other_schedule_ids
+                for r in schedules_queries.get_weekday_hours_rows(session, other_id)
+            ]
+            conflicts = find_overlaps(existing_shifts, normalized_shifts)
+            if conflicts:
+                logger.info(
+                    "schedule edit rejected: assignment overlap",
+                    extra={"schedule_id": schedule_id, "agent_id": agent_id, "lock_wait_ms": lock_wait_ms},
+                )
+                raise AssignmentOverlapError(agent_id=agent_id, conflicts=conflicts)
+
+        schedules_queries.replace_weekday_hours_rows(session, schedule_id, normalized_shifts)
+        rows = schedules_queries.get_weekday_hours_rows(session, schedule_id)
+        detail = _to_detail(schedule, rows)
+
+    logger.info(
+        "schedule hours updated",
+        extra={"schedule_id": schedule_id, "assignee_count": len(assignee_ids), "lock_wait_ms": lock_wait_ms},
+    )
+    return detail
+
+
+def get_deletion_impact(schedule_id: int) -> DeletionImpact:
+    with db_session_read() as session:
+        schedule = schedules_queries.get_schedule(session, schedule_id)
+        if schedule is None:
+            raise NotFoundError(f"schedule {schedule_id} not found")
+        agent_ids = schedule_agents_queries.list_active_assignee_agent_ids(session, schedule_id)
+        return DeletionImpact(schedule_id=schedule_id, affected_agent_ids=agent_ids)
+
+
+def soft_delete_schedule(schedule_id: int) -> None:
+    with db_session_write() as session:
+        schedule = schedules_queries.get_schedule(session, schedule_id)
+        if schedule is None:
+            raise NotFoundError(f"schedule {schedule_id} not found")
+        schedules_queries.soft_delete_schedule(session, schedule_id)
+        schedule_agents_queries.soft_delete_assignments_for_schedule(session, schedule_id)
+        schedules_queries.soft_delete_weekday_hours_for_schedule(session, schedule_id)
+    logger.info("schedule soft-deleted", extra={"schedule_id": schedule_id})
