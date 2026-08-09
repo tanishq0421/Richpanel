@@ -1,0 +1,97 @@
+@import 'tailwindcss';
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Richpanel design tokens.
+
+   Fonts and colours are taken from richpanel.com's own computed styles, so the
+   internal tool reads as part of the product rather than a bolted-on admin
+   panel. General Sans carries the UI (it is by far the dominant face on their
+   site); Nohemi is the heavy geometric display face used for their headlines.
+   Both are free from Fontshare and self-hosted here — no external font request,
+   which keeps CSP at font-src 'self' and removes a render-blocking third party.
+
+   The palette is deliberately narrow: their ink, their blue, their off-whites.
+   Semantic tokens below map product meaning onto it — conflict, impact, zero —
+   so a component never hardcodes a hex and meaning stays consistent.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+@font-face {
+  font-family: 'General Sans';
+  src: url('/fonts/GeneralSans-Variable.woff2') format('woff2-variations');
+  font-weight: 200 700;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Nohemi';
+  src: url('/fonts/Nohemi-Variable.woff2') format('woff2-variations');
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+@theme {
+  /* ── Type ─────────────────────────────────────────────────────────────── */
+  --font-sans: 'General Sans', ui-sans-serif, system-ui, sans-serif;
+  --font-display: 'Nohemi', 'General Sans', ui-sans-serif, sans-serif;
+  /* Tabular figures matter: a column of 22:30 / 02:30 must align vertically. */
+  --font-mono: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, monospace;
+
+  /* ── Ink (from richpanel.com) ─────────────────────────────────────────── */
+  --color-ink-900: #101828; /* primary text, filled buttons */
+  --color-ink-700: #3a3f4b; /* secondary text */
+  --color-ink-500: #667085; /* tertiary / labels */
+  --color-ink-400: #7d8ba1; /* placeholder, disabled */
+  --color-ink-200: #c4c9de; /* borders on tinted surfaces */
+
+  /* ── Surfaces ─────────────────────────────────────────────────────────── */
+  --color-surface: #ffffff;
+  --color-surface-sunken: #fafbfe; /* page background */
+  --color-surface-warm: #fbf7f2; /* callouts, empty states */
+  --color-hairline: #e8eaf0;
+
+  /* ── Brand ────────────────────────────────────────────────────────────── */
+  --color-brand-700: #003a70;
+  --color-brand: #004e96; /* their blue: coverage, links, focus */
+  --color-brand-100: #e6eef6;
+
+  /* ── Semantic: each colour means exactly one thing ────────────────────── */
+  --color-conflict: #b42318; /* 409 — overlapping schedules */
+  --color-conflict-bg: #fef3f2;
+  --color-impact: #dd6b00; /* deletion impact warning (their orange) */
+  --color-impact-bg: #fef6ee;
+  --color-covered: #004e96; /* hours present */
+  --color-zero: #98a2b3; /* zero hours — grey, never red: not an error */
+
+  /* ── Radii (from their components) ────────────────────────────────────── */
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-pill: 999px;
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    background: var(--color-surface-sunken);
+    color: var(--color-ink-900);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.5;
+  }
+
+  /* One visible focus treatment everywhere, using the brand blue. Never
+     removed — this tool is heavily keyboard-driven (see the Week Ribbon). */
+  :where(a, button, input, select, textarea, [tabindex]):focus-visible {
+    outline: 2px solid var(--color-brand);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  /* Times and durations are read as columns, not prose. */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: 'tnum';
+  }
+}
