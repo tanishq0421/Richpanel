@@ -54,7 +54,13 @@ export function ScheduleDetail({ scheduleId, onDeleted }: { scheduleId: number; 
             </p>
           </div>
           <div className="ml-auto flex shrink-0 items-center gap-2">
-            {days === 0 ? <Badge tone="zero">No hours set</Badge> : <Badge tone="brand">{days} days covered</Badge>}
+            {days === 0 ? (
+              <Badge tone="zero">No hours set</Badge>
+            ) : (
+              <Badge tone="brand">
+                {days} {days === 1 ? 'day' : 'days'} covered
+              </Badge>
+            )}
             <Button variant="danger" size="sm" onClick={() => setDeleteOpen(true)}>
               Delete
             </Button>
