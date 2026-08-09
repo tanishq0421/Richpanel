@@ -221,3 +221,271 @@ describe('WeeklyHoursEditor — disabled', () => {
     expect(screen.getByLabelText('Monday start time')).toBeDisabled()
   })
 })
+
+/**
+ * The preset bar is asserted through its accessible names, not its layout: the
+ * contract is "a button that says what it will do to which days at which time",
+ * and the wire shape it produces. Both survive the bar being restyled.
+ */
+const WEEKDAYS_BUTTON = 'Set Monday to Friday, 09:00 to 18:00'
+const WEEKENDS_BUTTON = 'Set Saturday and Sunday, 09:00 to 18:00'
+const EVERY_DAY_BUTTON = 'Set Every day, 09:00 to 18:00'
+const CLEAR_BUTTON = 'Clear all days'
+const NIGHT_SHIFT_BUTTON = 'Use night shift, 22:00 to 06:00'
+const BUSINESS_HOURS_BUTTON = 'Use business hours, 09:00 to 18:00'
+
+const press = (user: ReturnType<typeof userEvent.setup>, name: string | RegExp) =>
+  user.click(screen.getByRole('button', { name }))
+
+const lastEmitted = (onChange: ReturnType<typeof vi.fn>): ShiftDTO[] =>
+  onChange.mock.calls.at(-1)?.[0] as ShiftDTO[]
+
+describe('WeeklyHoursEditor — day-set presets', () => {
+  it('sets Monday to Friday and leaves the weekend off, in one click', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    render(<Harness onChange={onChange} />)
+
+    await press(user, WEEKDAYS_BUTTON)
+
+    expect(onChange).toHaveBeenCalledTimes(1)
+    expect(lastEmitted(onChange)).toEqual([
+      { weekday: 0, start_hours: 9, end_hours: 18 },
+      { weekday: 1, start_hours: 9, end_hours: 18 },
+      { weekday: 2, start_hours: 9, end_hours: 18 },
+      { weekday: 3, start_hours: 9, end_hours: 18 },
+      { weekday: 4, start_hours: 9, end_hours: 18 },
+    ])
+    expect(screen.getByRole('group', { name: 'Saturday, not worked' })).toBeInTheDocument()
+    expect(screen.getByRole('group', { name: 'Sunday, not worked' })).toBeInTheDocument()
+  })
+
+  it('sets exactly the two weekend days', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    render(<Harness onChange={onChange} />)
+
+    await press(user, WEEKENDS_BUTTON)
+
+    expect(lastEmitted(onChange)).toEqual([
+      { weekday: 5, start_hours: 9, end_hours: 18 },
+      { weekday: 6, start_hours: 9, end_hours: 18 },
+    ])
+  })
+
+  it('sets all seven days', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    render(<Harness onChange={onChange} />)
+
+    await press(user, EVERY_DAY_BUTTON)
+
+    expect(lastEmitted(onChange).map((shift) => shift.weekday)).toEqual([0, 1, 2, 3, 4, 5, 6])
+  })
+
+  it('clears the week to an empty array', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    render(
+      <Harness
+        onChange={onChange}
+        initial={[
+          { weekday: 0, start_hours: 9, end_hours: 17 },
+          { weekday: 3, start_hours: 22, end_hours: 6 },
+        ]}
+      />,
+    )
+
+    await press(user, CLEAR_BUTTON)
+
+    expect(lastEmitted(onChange)).toEqual([])
+    expect(screen.getByRole('group', { name: 'Monday, not worked' })).toBeInTheDocument()
+  })
+
+  it('replaces the day set rather than merging, so no weekday gains a second window', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    render(
+      <Harness
+        onChange={onChange}
+        initial={[
+          { weekday: 0, start_hours: 9, end_hours: 17 },
+          { weekday: 5, start_hours: 10, end_hours: 14 },
+        ]}
+      />,
+    )
+
+    // A manual edit first — the preset must overwrite it, not stack on top.
+    setTime('Monday start time', '08:00')
+    await press(user, WEEKDAYS_BUTTON)
+
+    const shifts = lastEmitted(onChange)
+    expect(shifts).toHaveLength(5)
+    expect(new Set(shifts.map((shift) => shift.weekday)).size).toBe(5)
+    expect(shifts.map((shift) => shift.weekday)).toEqual([0, 1, 2, 3, 4])
+    expect(shifts.every((shift) => shift.start_hours === 9 && shift.end_hours === 18)).toBe(true)
+    // Saturday was outside the set, so it is off — not left at 10:00–14:00.
+    expect(screen.getByRole('group', { name: 'Saturday, not worked' })).toBeInTheDocument()
+  })
+})
+
+describe('WeeklyHoursEditor — the common time the presets apply', () => {
+  it('applies a time chosen once to every day in the set', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    render(<Harness onChange={onChange} />)
+
+    setTime('Common start time', '10:30')
+    setTime('Common end time', '19:00')
+    await press(user, /^Set Saturday and Sunday, 10:30 to 19:00$/)
+
+    expect(lastEmitted(onChange)).toEqual([
+      { weekday: 5, start_hours: 10.5, end_hours: 19 },
+      { weekday: 6, start_hours: 10.5, end_hours: 19 },
+    ])
+  })
+
+  it('turns the night shift into one overnight shift that continues onto the next day', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    render(<Harness onChange={onChange} />)
+
+    await press(user, NIGHT_SHIFT_BUTTON)
+    await press(user, 'Set Monday to Friday, 22:00 to 06:00')
+
+    const shifts = lastEmitted(onChange)
+    expect(shifts).toHaveLength(5)
+    expect(shifts.every((shift) => shift.start_hours === 22 && shift.end_hours === 6)).toBe(true)
+
+    // Read back off the grid: one 8-hour shift, not two fragments.
+    expect(screen.getByRole('group', { name: 'Monday, 22:00 to 06:00 the next day, 8 hours' })).toBeInTheDocument()
+    // Saturday is off, yet Friday's shift still lands on it.
+    expect(
+      screen.getByRole('group', { name: "Saturday, not worked. Friday's shift continues until 06:00." }),
+    ).toBeInTheDocument()
+  })
+
+  it('returns to business hours without touching the pickers', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    render(<Harness onChange={onChange} />)
+
+    await press(user, NIGHT_SHIFT_BUTTON)
+    await press(user, BUSINESS_HOURS_BUTTON)
+    await press(user, WEEKDAYS_BUTTON)
+
+    expect(lastEmitted(onChange).every((shift) => shift.start_hours === 9 && shift.end_hours === 18)).toBe(true)
+  })
+
+  it('never emits an end of 00:00 or a zero-length shift, whichever preset is used', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    render(<Harness onChange={onChange} />)
+
+    for (const shiftPreset of [BUSINESS_HOURS_BUTTON, NIGHT_SHIFT_BUTTON]) {
+      await press(user, shiftPreset)
+      for (const daySet of ['Monday to Friday', 'Saturday and Sunday', 'Every day']) {
+        await press(user, new RegExp(`^Set ${daySet},`))
+      }
+    }
+    await press(user, CLEAR_BUTTON)
+
+    expect(onChange).toHaveBeenCalledTimes(7)
+    for (const [emitted] of onChange.mock.calls as [ShiftDTO[]][]) {
+      for (const shift of emitted) {
+        expect(shift.end_hours).not.toBe(0)
+        expect(shift.start_hours).not.toBe(shift.end_hours)
+      }
+    }
+  })
+
+  it('refuses to apply a common time the backend would reject', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    render(<Harness onChange={onChange} />)
+
+    setTime('Common end time', '00:00')
+
+    expect(screen.getByText(/cannot end at 00:00/i)).toHaveTextContent('23:45')
+    for (const name of [/^Set Monday to Friday/, /^Set Saturday and Sunday/, /^Set Every day/]) {
+      expect(screen.getByRole('button', { name })).toBeDisabled()
+    }
+    // Clear needs no times, so it must stay usable.
+    expect(screen.getByRole('button', { name: CLEAR_BUTTON })).toBeEnabled()
+    expect(onChange).not.toHaveBeenCalled()
+
+    setTime('Common end time', '23:45')
+    await press(user, /^Set Saturday and Sunday, 09:00 to 23:45$/)
+
+    expect(lastEmitted(onChange)).toEqual([
+      { weekday: 5, start_hours: 9, end_hours: 23.75 },
+      { weekday: 6, start_hours: 9, end_hours: 23.75 },
+    ])
+  })
+
+  it('refuses a zero-length common time', () => {
+    const onChange = vi.fn()
+    render(<Harness onChange={onChange} />)
+
+    setTime('Common end time', '09:00')
+
+    expect(screen.getByText(/cannot be the same time/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^Set Every day/ })).toBeDisabled()
+    expect(onChange).not.toHaveBeenCalled()
+  })
+})
+
+describe('WeeklyHoursEditor — presets and the rest of the editor', () => {
+  it('announces what a preset changed', async () => {
+    const user = userEvent.setup()
+    render(<Harness />)
+
+    await press(user, WEEKDAYS_BUTTON)
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Monday to Friday set to 09:00 to 18:00. All other days cleared.',
+    )
+
+    await press(user, CLEAR_BUTTON)
+    expect(screen.getByRole('status')).toHaveTextContent('All days cleared. No hours set.')
+  })
+
+  it('names the midnight crossing when the applied time is overnight', async () => {
+    const user = userEvent.setup()
+    render(<Harness />)
+
+    await press(user, NIGHT_SHIFT_BUTTON)
+    await press(user, 'Set Every day, 22:00 to 06:00')
+
+    expect(screen.getByRole('status')).toHaveTextContent('running past midnight into the next day')
+  })
+
+  it('drops a row-local rejected time when a preset overwrites that row', async () => {
+    const user = userEvent.setup()
+    render(<Harness initial={[{ weekday: 0, start_hours: 9, end_hours: 17 }]} />)
+
+    setTime('Monday end time', '00:00')
+    expect(screen.getByText(/cannot end at 00:00/i)).toBeInTheDocument()
+
+    await press(user, WEEKDAYS_BUTTON)
+
+    expect(screen.queryByText(/cannot end at 00:00/i)).toBeNull()
+    expect(screen.getByRole('group', { name: 'Monday, 09:00 to 18:00, 9 hours' })).toBeInTheDocument()
+  })
+
+  it('locks the whole preset bar when the editor is disabled', () => {
+    render(<Harness disabled />)
+
+    for (const name of [
+      WEEKDAYS_BUTTON,
+      WEEKENDS_BUTTON,
+      EVERY_DAY_BUTTON,
+      CLEAR_BUTTON,
+      BUSINESS_HOURS_BUTTON,
+      NIGHT_SHIFT_BUTTON,
+    ]) {
+      expect(screen.getByRole('button', { name })).toBeDisabled()
+    }
+    expect(screen.getByLabelText('Common start time')).toBeDisabled()
+    expect(screen.getByLabelText('Common end time')).toBeDisabled()
+  })
+})

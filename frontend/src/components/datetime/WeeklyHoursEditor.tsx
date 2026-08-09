@@ -3,6 +3,7 @@ import type { ShiftDTO, Weekday } from '@/api/types'
 import { WEEKDAYS, nextWeekday, weekdayLong, weekdayShort } from '@/helpers/weekday'
 import { formatBusinessSeconds, hhmmToHours, hoursToHHMM, isOvernight, shiftDurationHours } from '@/helpers/time'
 import { TimePicker } from '@/components/datetime/TimePicker'
+import { Button } from '@/components/ui'
 import { cn } from '@/lib/cn'
 
 export interface WeeklyHoursEditorProps {
@@ -35,6 +36,166 @@ export function shiftError(startHHMM: string, endHHMM: string): string | null {
   if (endHHMM === '00:00') return MIDNIGHT_END_MESSAGE
   if (startHHMM === endHHMM) return ZERO_LENGTH_MESSAGE
   return null
+}
+
+/** What the preset bar opens on. Deliberately not `DEFAULT_*_HOURS`: the row
+ *  toggle answers "what does one more day look like", the bar answers "what
+ *  does a working week look like", and 09:00–18:00 is the latter. */
+const COMMON_START = '09:00'
+const COMMON_END = '18:00'
+
+/**
+ * The day sets. `days` is the WHOLE set the grid ends up with — applying
+ * replaces the array rather than merging into it, which is both how "turn the
+ * right days on and leave the rest off" is met and why a weekday can never end
+ * up with two windows: every set is a literal list of distinct weekdays.
+ */
+const DAY_SETS: { id: string; label: string; name: string; days: Weekday[] }[] = [
+  { id: 'weekdays', label: 'Mon–Fri', name: 'Monday to Friday', days: [0, 1, 2, 3, 4] },
+  { id: 'weekends', label: 'Sat–Sun', name: 'Saturday and Sunday', days: [5, 6] },
+  { id: 'everyday', label: 'Every day', name: 'Every day', days: [0, 1, 2, 3, 4, 5, 6] },
+]
+
+/**
+ * The two shifts people actually name. They fill the common hours and stop
+ * there — "night shift" says nothing about *which* days, so a chip that
+ * silently rewrote seven rows would be guessing. Business hours doubles as the
+ * way back from a night shift without touching the pickers.
+ */
+const SHIFT_PRESETS = [
+  { label: 'Business hours', name: 'business hours', start: COMMON_START, end: COMMON_END },
+  { label: 'Night shift', name: 'night shift', start: '22:00', end: '06:00' },
+]
+
+/**
+ * THE PRESET BAR — one time, chosen once, applied to a set of days.
+ *
+ * The interaction is "pick the hours, then pick the days", not "apply a canned
+ * week, then correct five rows". The pickers open already holding 09:00–18:00,
+ * so the overwhelmingly common answer — Mon–Fri, business hours — is a single
+ * click on `Mon–Fri`; anything else costs the two picker interactions it
+ * genuinely needs instead of ten.
+ *
+ * It emits whole schedules, never partial ones, and it validates the pair with
+ * the same `shiftError` a row uses at the same moment the row would: an invalid
+ * common time disables the apply buttons rather than being pushed upward. The
+ * editor's promise — `value` is always something the API accepts — holds.
+ */
+function PresetBar({ disabled, onApply }: { disabled: boolean; onApply: (shifts: ShiftDTO[]) => void }) {
+  const [start, setStart] = useState(COMMON_START)
+  const [end, setEnd] = useState(COMMON_END)
+  /** Seven rows changing at once is the least visible edit in this component
+   *  and the largest, so it is the one that has to be spoken. */
+  const [announcement, setAnnouncement] = useState('')
+
+  const commonError = shiftError(start, end)
+
+  function applyShiftPreset(preset: (typeof SHIFT_PRESETS)[number]) {
+    setStart(preset.start)
+    setEnd(preset.end)
+    setAnnouncement(`Common hours set to ${preset.start} to ${preset.end}. Choose the days to apply them to.`)
+  }
+
+  function applyDaySet(set: (typeof DAY_SETS)[number]) {
+    const startHours = hhmmToHours(start)
+    const endHours = hhmmToHours(end)
+    onApply(set.days.map((weekday) => ({ weekday, start_hours: startHours, end_hours: endHours })))
+    setAnnouncement(
+      [
+        `${set.name} set to ${start} to ${end}`,
+        isOvernight(startHours, endHours) ? ', running past midnight into the next day' : '',
+        '.',
+        set.days.length < 7 ? ' All other days cleared.' : '',
+      ].join(''),
+    )
+  }
+
+  function clearAll() {
+    onApply([])
+    setAnnouncement('All days cleared. No hours set.')
+  }
+
+  const label = 'text-[11px] font-medium tracking-wide text-[var(--color-ink-500)] uppercase'
+
+  return (
+    <div
+      role="group"
+      aria-label="Quick setup"
+      className="flex flex-col gap-1.5 rounded-[var(--radius-lg)] border border-[var(--color-hairline)] bg-[var(--color-surface-sunken)] px-3 py-2.5"
+    >
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className={label}>Common hours</span>
+          <div className="w-[112px]">
+            <TimePicker value={start} onChange={setStart} aria-label="Common start time" disabled={disabled} />
+          </div>
+          <span className="text-[13px] text-[var(--color-ink-500)]">to</span>
+          <div className="w-[112px]">
+            <TimePicker value={end} onChange={setEnd} aria-label="Common end time" disabled={disabled} />
+          </div>
+          {/* The shift chips are two spellings of the same control, so they stay
+              on one line together — wrapping "Night shift" under "Business
+              hours" reads as a separate section rather than an alternative. */}
+          <div className="flex shrink-0 flex-nowrap items-center gap-1">
+            {SHIFT_PRESETS.map((preset) => (
+              <Button
+                key={preset.label}
+                type="button"
+                variant="ghost"
+                size="sm"
+                disabled={disabled}
+                aria-label={`Use ${preset.name}, ${preset.start} to ${preset.end}`}
+                onClick={() => applyShiftPreset(preset)}
+              >
+                {preset.label}
+              </Button>
+            ))}
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <span className={label}>Apply to</span>
+          {DAY_SETS.map((set) => (
+            <Button
+              key={set.id}
+              type="button"
+              variant="secondary"
+              size="sm"
+              /* An invalid common time cannot be applied to anything — the
+                 buttons go away rather than the rule being explained twice. */
+              disabled={disabled || commonError !== null}
+              aria-label={`Set ${set.name}, ${start} to ${end}`}
+              onClick={() => applyDaySet(set)}
+            >
+              {set.label}
+            </Button>
+          ))}
+          {/* Clear needs no times, so an invalid pair must not lock the user out
+              of the one action that gets them back to a clean grid. */}
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            disabled={disabled}
+            aria-label="Clear all days"
+            onClick={clearAll}
+          >
+            Clear
+          </Button>
+        </div>
+      </div>
+
+      {commonError && (
+        <p className="text-[12px] text-[var(--color-conflict)]" role="alert">
+          {commonError}
+        </p>
+      )}
+
+      <p role="status" className="sr-only">
+        {announcement}
+      </p>
+    </div>
+  )
 }
 
 const percent = (hours: number) => `${(hours / 24) * 100}%`
@@ -70,6 +231,9 @@ interface DayRowProps {
   /** Set when the *previous* weekday's shift runs past midnight into this one. */
   incomingFrom: Weekday | null
   incomingEndHours: number | null
+  /** Bumped once per preset application. A number, so it is stable across
+   *  every ordinary edit and the memo below still holds while typing. */
+  resetToken: number
   disabled: boolean
   onChangeDay: (weekday: Weekday, next: ShiftDTO | null) => void
 }
@@ -99,6 +263,7 @@ const DayRow = memo(function DayRow({
   endHours,
   incomingFrom,
   incomingEndHours,
+  resetToken,
   disabled,
   onChangeDay,
 }: DayRowProps) {
@@ -111,6 +276,13 @@ const DayRow = memo(function DayRow({
    * spelled out underneath.
    */
   const [draft, setDraft] = useState<{ start: string; end: string } | null>(null)
+
+  /* A preset overwrites this row wholesale, so the rejected value the user was
+     mid-way through fixing belongs to a schedule that no longer exists. Left
+     alone it would keep shadowing the new time and keep showing its message. */
+  useEffect(() => {
+    setDraft(null)
+  }, [resetToken])
 
   // One object rather than two loose numbers, so every downstream use is
   // narrowed by a single truthiness check instead of re-testing both halves.
@@ -339,6 +511,14 @@ export function WeeklyHoursEditor({ value, onChange, disabled = false, error }: 
     latest.current = { value, onChange }
   })
 
+  /** Incremented on every preset application — see the reset effect in DayRow. */
+  const [resetToken, setResetToken] = useState(0)
+
+  function applyPreset(shifts: ShiftDTO[]) {
+    setResetToken((token) => token + 1)
+    onChange(shifts)
+  }
+
   const onChangeDay = useCallback((weekday: Weekday, next: ShiftDTO | null) => {
     const { value: current, onChange: emit } = latest.current
     const rest = current.filter((shift) => shift.weekday !== weekday)
@@ -349,6 +529,10 @@ export function WeeklyHoursEditor({ value, onChange, disabled = false, error }: 
 
   return (
     <div className="flex flex-col gap-2">
+      {/* Above the grid, because it is what most users should touch first —
+          seven rows by hand is the fallback, not the intended path. */}
+      <PresetBar disabled={disabled} onApply={applyPreset} />
+
       <div className="overflow-x-auto">
         <div className="min-w-[760px] overflow-hidden rounded-[var(--radius-lg)] border border-[var(--color-hairline)]">
           {/* Column headings, and the hour axis the tracks are read against. */}
@@ -392,6 +576,7 @@ export function WeeklyHoursEditor({ value, onChange, disabled = false, error }: 
                 endHours={shift ? shift.end_hours : null}
                 incomingFrom={incoming ? incoming.from : null}
                 incomingEndHours={incoming ? incoming.endHours : null}
+                resetToken={resetToken}
                 disabled={disabled}
                 onChangeDay={onChangeDay}
               />
