@@ -161,32 +161,152 @@ describe('DeletionImpactModal', () => {
 })
 
 describe('AssignAgentModal', () => {
+  /** The endpoint takes one agent per call, so the stub answers per agent. */
+  function answerPerAgent(answers: Record<number, ApiError | undefined> = {}) {
+    mocks.assignMutate.mockImplementation((input: any, options: any) => {
+      const error = answers[input.agentId]
+      if (error) options.onError(error)
+      else options.onSuccess()
+    })
+  }
+
+  const checkbox = (name: RegExp) => screen.getByRole('checkbox', { name })
+  const finder = () => screen.getByPlaceholderText('Name or email')
+
+  it('offers a real checkbox group, so selection is a state and not a colour', async () => {
+    const user = userEvent.setup()
+    mocks.state.agents = loaded(AGENTS)
+    mocks.state.assignees = loaded([])
+
+    render(<AssignAgentModal open onOpenChange={vi.fn()} scheduleId={7} />)
+
+    const group = screen.getByRole('group', { name: 'Assignable agents' })
+    expect(group).toBeInTheDocument()
+    // Every row carries its own name, so a screen reader reads the person
+    // rather than "checkbox, unchecked".
+    expect(checkbox(/Ana Rao/)).not.toBeChecked()
+
+    // Reachable and operable from the keyboard alone: focus the first box,
+    // tick it with Space, walk down with the arrows, tick the next.
+    checkbox(/Ana Rao/).focus()
+    await user.keyboard(' ')
+    expect(checkbox(/Ana Rao/)).toBeChecked()
+
+    await user.keyboard('{ArrowDown}')
+    expect(checkbox(/Bo Chen/)).toHaveFocus()
+    await user.keyboard(' ')
+
+    expect(checkbox(/Bo Chen/)).toBeChecked()
+    expect(checkbox(/Cyd Iyer/)).not.toBeChecked()
+    expect(screen.getByRole('button', { name: 'Assign 2 agents' })).toBeEnabled()
+  })
+
+  it('issues one assign request per selected agent', async () => {
+    const user = userEvent.setup()
+    mocks.state.agents = loaded(AGENTS)
+    mocks.state.assignees = loaded([])
+    answerPerAgent()
+
+    render(<AssignAgentModal open onOpenChange={vi.fn()} scheduleId={7} />)
+
+    await user.click(checkbox(/Ana Rao/))
+    await user.click(checkbox(/Bo Chen/))
+    await user.click(checkbox(/Cyd Iyer/))
+
+    // The running count is what tells the user how big the batch is.
+    await user.click(screen.getByRole('button', { name: 'Assign 3 agents' }))
+
+    await waitFor(() => expect(mocks.assignMutate).toHaveBeenCalledTimes(3))
+    // One request per agent, in the order they appear in the list.
+    expect(mocks.assignMutate.mock.calls.map(([input]) => input)).toEqual([
+      { scheduleId: 7, agentId: 1 },
+      { scheduleId: 7, agentId: 2 },
+      { scheduleId: 7, agentId: 3 },
+    ])
+  })
+
+  it('toasts once for the whole batch and closes when every agent lands', async () => {
+    const user = userEvent.setup()
+    const onOpenChange = vi.fn()
+    mocks.state.agents = loaded(AGENTS)
+    mocks.state.assignees = loaded([])
+    answerPerAgent()
+
+    render(<AssignAgentModal open onOpenChange={onOpenChange} scheduleId={7} />)
+
+    await user.click(checkbox(/Ana Rao/))
+    await user.click(checkbox(/Bo Chen/))
+    await user.click(screen.getByRole('button', { name: 'Assign 2 agents' }))
+
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+    // Two requests, one notification — a toast per agent would be noise.
+    expect(mocks.toast).toHaveBeenCalledTimes(1)
+    expect(mocks.toast).toHaveBeenCalledWith({
+      tone: 'success',
+      message: '2 agents assigned to this schedule.',
+    })
+  })
+
   it('renders a 409 inline instead of throwing', async () => {
     const user = userEvent.setup()
     mocks.state.agents = loaded(AGENTS)
     mocks.state.assignees = loaded([])
-    mocks.assignMutate.mockImplementation((_input: unknown, options: any) => {
-      options.onError(
-        new ApiError(
-          'conflict',
-          409,
-          'agent_schedule_conflict',
-          'Ana Rao already works 09:00-17:00 on "Day shift".',
-        ),
-      )
+    answerPerAgent({
+      1: new ApiError(
+        'conflict',
+        409,
+        'agent_schedule_conflict',
+        'Ana Rao already works 09:00-17:00 on "Day shift".',
+      ),
     })
 
     render(<AssignAgentModal open onOpenChange={vi.fn()} scheduleId={7} />)
 
-    await user.click(screen.getByRole('radio', { name: /Ana Rao/ }))
-    await user.click(screen.getByRole('button', { name: 'Assign' }))
+    await user.click(checkbox(/Ana Rao/))
+    await user.click(screen.getByRole('button', { name: 'Assign 1 agent' }))
 
     const banner = await screen.findByRole('alert')
+    expect(banner).toHaveTextContent('Ana Rao')
     expect(banner).toHaveTextContent('already works 09:00-17:00')
     // An expected rejection belongs next to the control, not in a toast that
     // outlives the context that makes it fixable.
     expect(mocks.toast).not.toHaveBeenCalled()
-    expect(screen.getByRole('radio', { name: /Ana Rao/ })).toBeChecked()
+    expect(checkbox(/Ana Rao/)).toBeChecked()
+  })
+
+  it('stops the batch on a rejection and does not pretend the writes were undone', async () => {
+    const user = userEvent.setup()
+    const onOpenChange = vi.fn()
+    mocks.state.agents = loaded(AGENTS)
+    mocks.state.assignees = loaded([])
+    answerPerAgent({
+      2: new ApiError('conflict', 409, 'agent_schedule_conflict', 'Bo Chen already works 09:00-17:00.'),
+    })
+
+    render(<AssignAgentModal open onOpenChange={onOpenChange} scheduleId={7} />)
+
+    await user.click(checkbox(/Ana Rao/))
+    await user.click(checkbox(/Bo Chen/))
+    await user.click(checkbox(/Cyd Iyer/))
+    await user.click(screen.getByRole('button', { name: 'Assign 3 agents' }))
+
+    const banner = await screen.findByRole('alert')
+    expect(banner).toHaveTextContent('Bo Chen already works 09:00-17:00')
+    // Ana went through before Bo was rejected, and she really is assigned.
+    expect(banner).toHaveTextContent(/1 agent assigned before this \(Ana Rao\)/)
+    expect(banner).toHaveTextContent(/nothing was undone/i)
+
+    // Cyd was never attempted: the batch stops rather than pressing on.
+    expect(mocks.assignMutate).toHaveBeenCalledTimes(2)
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    expect(onOpenChange).not.toHaveBeenCalled()
+    expect(mocks.toast).not.toHaveBeenCalled()
+    // Ana drops out of the picker — she is assigned now — and is no longer part
+    // of a retry, while the untouched pair stay ticked.
+    expect(screen.queryByRole('checkbox', { name: /Ana Rao/ })).toBeNull()
+    expect(checkbox(/Bo Chen/)).toBeChecked()
+    expect(checkbox(/Cyd Iyer/)).toBeChecked()
+    expect(screen.getByRole('button', { name: 'Assign 2 agents' })).toBeEnabled()
   })
 
   it('leaves out agents who are already assigned', () => {
@@ -195,9 +315,9 @@ describe('AssignAgentModal', () => {
 
     render(<AssignAgentModal open onOpenChange={vi.fn()} scheduleId={7} />)
 
-    expect(screen.queryByRole('radio', { name: /Ana Rao/ })).toBeNull()
-    expect(screen.getByRole('radio', { name: /Bo Chen/ })).toBeInTheDocument()
-    expect(screen.getByRole('radio', { name: /Cyd Iyer/ })).toBeInTheDocument()
+    expect(screen.queryByRole('checkbox', { name: /Ana Rao/ })).toBeNull()
+    expect(checkbox(/Bo Chen/)).toBeInTheDocument()
+    expect(checkbox(/Cyd Iyer/)).toBeInTheDocument()
   })
 
   it('filters the list as the user searches', async () => {
@@ -207,9 +327,46 @@ describe('AssignAgentModal', () => {
 
     render(<AssignAgentModal open onOpenChange={vi.fn()} scheduleId={7} />)
 
-    await user.type(screen.getByPlaceholderText('Name or email'), 'cyd')
+    await user.type(finder(), 'cyd')
 
-    expect(screen.getByRole('radio', { name: /Cyd Iyer/ })).toBeInTheDocument()
-    expect(screen.queryByRole('radio', { name: /Ana Rao/ })).toBeNull()
+    expect(checkbox(/Cyd Iyer/)).toBeInTheDocument()
+    expect(screen.queryByRole('checkbox', { name: /Ana Rao/ })).toBeNull()
+  })
+
+  it('select all takes the filtered set only, and the selection survives the filter', async () => {
+    const user = userEvent.setup()
+    mocks.state.agents = loaded(AGENTS)
+    mocks.state.assignees = loaded([])
+
+    render(<AssignAgentModal open onOpenChange={vi.fn()} scheduleId={7} />)
+
+    // "o" matches Ana Rao and Bo Chen, but not Cyd Iyer.
+    await user.type(finder(), 'o')
+    await user.click(screen.getByRole('button', { name: 'Select all' }))
+
+    expect(screen.getByRole('button', { name: 'Assign 2 agents' })).toBeEnabled()
+
+    await user.clear(finder())
+
+    expect(checkbox(/Ana Rao/)).toBeChecked()
+    expect(checkbox(/Bo Chen/)).toBeChecked()
+    // The agent who was off screen was never swept up …
+    expect(checkbox(/Cyd Iyer/)).not.toBeChecked()
+    // … and hiding a row does not silently drop it from the batch either.
+    expect(screen.getByRole('button', { name: 'Assign 2 agents' })).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Clear all' }))
+    expect(screen.getByRole('button', { name: 'Assign agents' })).toBeDisabled()
+  })
+
+  it('will not assign with nothing selected', () => {
+    mocks.state.agents = loaded(AGENTS)
+    mocks.state.assignees = loaded([])
+
+    render(<AssignAgentModal open onOpenChange={vi.fn()} scheduleId={7} />)
+
+    expect(screen.getByRole('button', { name: 'Assign agents' })).toBeDisabled()
+    expect(screen.getByText('No agents selected')).toBeInTheDocument()
+    expect(mocks.assignMutate).not.toHaveBeenCalled()
   })
 })
