@@ -48,6 +48,56 @@ def test_assign_conflicting_schedule_returns_409(db):
     assert response.status_code == 409
 
 
+def test_conflict_check_names_the_conflicting_schedule(db):
+    # The whole point: the UI must be able to say "Bob is on Night Shift" and
+    # offer to free him from it, which needs the schedule's identity -- not just
+    # "there is an overlap".
+    agent_id = _create_agent()
+    day = _create_schedule("Day Shift", [{"weekday": 0, "start_hours": 9, "end_hours": 17}])
+    overlapping = _create_schedule("Overlapping", [{"weekday": 0, "start_hours": 12, "end_hours": 20}])
+    client.post(f"/api/v1/schedules/{day}/agents", json={"agent_id": agent_id})
+
+    response = client.post(f"/api/v1/schedules/{overlapping}/agents/check", json={"agent_ids": [agent_id]})
+
+    assert response.status_code == 200
+    conflicts = response.json()["conflicts"]
+    assert len(conflicts) == 1
+    assert conflicts[0]["agent_id"] == agent_id
+    assert conflicts[0]["conflicts"][0]["schedule_id"] == day
+    assert conflicts[0]["conflicts"][0]["schedule_name"] == "Day Shift"
+    colliding = conflicts[0]["conflicts"][0]["colliding_shifts"][0]
+    assert colliding["weekday"] == 0
+    assert colliding["existing_start_hours"] == 9.0
+    assert colliding["new_start_hours"] == 12.0
+
+
+def test_conflict_check_omits_assignable_agents(db):
+    free_agent = _create_agent("Free")
+    schedule = _create_schedule("A", [{"weekday": 0, "start_hours": 9, "end_hours": 17}])
+
+    response = client.post(f"/api/v1/schedules/{schedule}/agents/check", json={"agent_ids": [free_agent]})
+
+    assert response.status_code == 200
+    assert response.json()["conflicts"] == []
+
+
+def test_conflict_check_writes_nothing(db):
+    agent_id = _create_agent()
+    day = _create_schedule("Day", [{"weekday": 0, "start_hours": 9, "end_hours": 17}])
+    other = _create_schedule("Other", [{"weekday": 0, "start_hours": 12, "end_hours": 20}])
+    client.post(f"/api/v1/schedules/{day}/agents", json={"agent_id": agent_id})
+
+    client.post(f"/api/v1/schedules/{other}/agents/check", json={"agent_ids": [agent_id]})
+
+    # The check is a read: the agent must not have been assigned anywhere new.
+    assert [a["id"] for a in client.get(f"/api/v1/schedules/{other}/agents").json()] == []
+    assert [a["id"] for a in client.get(f"/api/v1/schedules/{day}/agents").json()] == [agent_id]
+
+
+def test_conflict_check_404s_for_a_missing_schedule(db):
+    assert client.post("/api/v1/schedules/999999/agents/check", json={"agent_ids": []}).status_code == 404
+
+
 def test_unassign_agent(db):
     agent_id = _create_agent()
     schedule_id = _create_schedule("A", [])
