@@ -31,6 +31,15 @@ def get_schedule(session: Session, schedule_id: int) -> Schedule | None:
     return session.scalars(stmt).one_or_none()
 
 
+def get_schedules(session: Session, schedule_ids: list[int]) -> dict[int, Schedule]:
+    """Batched form of get_schedule: one WHERE id IN (...) query for every
+    requested schedule, keyed by id, instead of N calls to get_schedule."""
+    if not schedule_ids:
+        return {}
+    stmt = select(Schedule).where(Schedule.id.in_(schedule_ids), Schedule.deleted_at.is_(None))
+    return {s.id: s for s in session.scalars(stmt)}
+
+
 def list_active_schedules(session: Session, limit: int, offset: int) -> list[Schedule]:
     stmt = select(Schedule).where(Schedule.deleted_at.is_(None)).order_by(Schedule.id).limit(limit).offset(offset)
     return list(session.scalars(stmt))

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from app.components.agents import queries as agents_queries
 from app.components.agents.model import Agent
 from app.components.agents.queries import get_agent
+from app.components.reports import queries as reports_queries
 from app.components.schedule_agents import queries as schedule_agents_queries
 from app.components.schedules import queries as schedules_queries
 from app.components.schedules.model import Schedule
@@ -40,26 +41,50 @@ class AgentConflict:
     conflicts: list[ScheduleConflict]
 
 
+def _conflicts_for_agents(
+    session, agent_ids: list[int], target_shifts: list[WeekdayShift], exclude_schedule_id: int | None
+) -> dict[int, list[ScheduleConflict]]:
+    """Batched form of the per-agent conflict check: for N candidate agents,
+    issues one query for every OTHER active schedule id per agent, one query
+    for the weekday-hours of the UNION of those schedule ids, and one query
+    for their names -- regardless of how many agents or how many schedules
+    they're spread across. Replaces what used to be 2 extra queries per OTHER
+    schedule, per agent (the N+1 pattern).
+
+    Compares per schedule rather than against one flattened list of shifts.
+    Flattening loses which schedule produced the collision, which is exactly
+    the fact the UI needs in order to say 'Bob is on Night Shift' and offer to
+    remove him from it."""
+    other_ids_by_agent = schedule_agents_queries.get_other_active_schedule_ids_for_agents(
+        session, agent_ids, exclude_schedule_id=exclude_schedule_id
+    )
+    all_other_ids = sorted({sid for ids in other_ids_by_agent.values() for sid in ids})
+    hours_by_schedule = reports_queries.get_weekday_hours_for_schedules(session, all_other_ids)
+    schedules_by_id = schedules_queries.get_schedules(session, all_other_ids)
+
+    result: dict[int, list[ScheduleConflict]] = {}
+    for agent_id in agent_ids:
+        found: list[ScheduleConflict] = []
+        for other_id in other_ids_by_agent.get(agent_id, []):
+            other = schedules_by_id.get(other_id)
+            if other is None:
+                continue
+            other_shifts = [weekday_shift_from_row(r) for r in hours_by_schedule.get(other_id, [])]
+            overlaps = find_overlaps(other_shifts, target_shifts)
+            if overlaps:
+                found.append(ScheduleConflict(schedule_id=other_id, schedule_name=other.name, colliding=overlaps))
+        result[agent_id] = found
+    return result
+
+
 def _conflicts_for_agent(
     session, agent_id: int, target_shifts: list[WeekdayShift], exclude_schedule_id: int | None
 ) -> list[ScheduleConflict]:
-    """Compare per schedule rather than against one flattened list of shifts.
-
-    Flattening loses which schedule produced the collision, which is exactly the
-    fact the UI needs in order to say 'Bob is on Night Shift' and offer to
-    remove him from it."""
-    found: list[ScheduleConflict] = []
-    other_ids = schedule_agents_queries.get_other_active_schedule_ids_for_agent(
-        session, agent_id, exclude_schedule_id=exclude_schedule_id
-    )
-    for other_id in other_ids:
-        other = schedules_queries.get_schedule(session, other_id)
-        if other is None:
-            continue
-        overlaps = find_overlaps(_weekday_shifts_for_schedule(session, other_id), target_shifts)
-        if overlaps:
-            found.append(ScheduleConflict(schedule_id=other_id, schedule_name=other.name, colliding=overlaps))
-    return found
+    """Single-agent conflict check used by assign_agent's write path, where
+    only one candidate is ever checked under the write lock. Delegates to the
+    batched helper with a one-element list so both call sites share one code
+    path and one query shape."""
+    return _conflicts_for_agents(session, [agent_id], target_shifts, exclude_schedule_id)[agent_id]
 
 
 def find_assignment_conflicts(schedule_id: int, agent_ids: list[int]) -> list[AgentConflict]:
@@ -77,14 +102,23 @@ def find_assignment_conflicts(schedule_id: int, agent_ids: list[int]) -> list[Ag
         target_shifts = _weekday_shifts_for_schedule(session, schedule_id)
         already_assigned = set(schedule_agents_queries.list_active_assignee_agent_ids(session, schedule_id))
 
+        # Dedup + drop already-assigned before batching: they're filtered from
+        # the picker anyway, and there's no reason to look up their schedules.
+        candidate_ids = [aid for aid in dict.fromkeys(agent_ids) if aid not in already_assigned]
+        agents_by_id = agents_queries.get_agents(session, candidate_ids)
+        existing_candidate_ids = [aid for aid in candidate_ids if aid in agents_by_id]
+        conflicts_by_agent = _conflicts_for_agents(
+            session, existing_candidate_ids, target_shifts, exclude_schedule_id=schedule_id
+        )
+
         results: list[AgentConflict] = []
         for agent_id in agent_ids:
-            agent = get_agent(session, agent_id)
+            agent = agents_by_id.get(agent_id)
             if agent is None or agent_id in already_assigned:
                 # A missing agent is not this endpoint's business, and an
                 # already-assigned one is filtered from the picker anyway.
                 continue
-            conflicts = _conflicts_for_agent(session, agent_id, target_shifts, exclude_schedule_id=schedule_id)
+            conflicts = conflicts_by_agent.get(agent_id, [])
             if conflicts:
                 results.append(AgentConflict(agent_id=agent_id, agent_name=agent.name, conflicts=conflicts))
         return results

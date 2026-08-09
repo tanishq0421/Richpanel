@@ -98,6 +98,39 @@ def test_conflict_check_404s_for_a_missing_schedule(db):
     assert client.post("/api/v1/schedules/999999/agents/check", json={"agent_ids": []}).status_code == 404
 
 
+def test_conflict_check_batches_correctly_across_multiple_agents(db):
+    # Exercises the batched find_assignment_conflicts path (a single call
+    # covering several candidate agents spread across several OTHER
+    # schedules) and asserts it still resolves each agent's conflicts
+    # independently and by the right schedule -- i.e. batching one query per
+    # step behind the scenes must produce the exact same per-agent,
+    # per-schedule results the old N+1 loop did.
+    day = _create_schedule("Day Shift", [{"weekday": 0, "start_hours": 9, "end_hours": 17}])
+    evening = _create_schedule("Evening Shift", [{"weekday": 0, "start_hours": 20, "end_hours": 23}])
+    target = _create_schedule("Target", [{"weekday": 0, "start_hours": 12, "end_hours": 20}])
+
+    conflicting_agent = _create_agent("Conflicting")  # on Day Shift -> overlaps Target
+    clean_agent = _create_agent("Clean")  # on Evening Shift -> no overlap with Target
+    free_agent = _create_agent("Free")  # on no schedule at all
+    already_on_target = _create_agent("AlreadyOnTarget")  # assigned to Target itself
+
+    client.post(f"/api/v1/schedules/{day}/agents", json={"agent_id": conflicting_agent})
+    client.post(f"/api/v1/schedules/{evening}/agents", json={"agent_id": clean_agent})
+    client.post(f"/api/v1/schedules/{target}/agents", json={"agent_id": already_on_target})
+
+    response = client.post(
+        f"/api/v1/schedules/{target}/agents/check",
+        json={"agent_ids": [conflicting_agent, clean_agent, free_agent, already_on_target]},
+    )
+
+    assert response.status_code == 200
+    conflicts = response.json()["conflicts"]
+    assert len(conflicts) == 1
+    assert conflicts[0]["agent_id"] == conflicting_agent
+    assert conflicts[0]["conflicts"][0]["schedule_id"] == day
+    assert conflicts[0]["conflicts"][0]["schedule_name"] == "Day Shift"
+
+
 def test_unassign_agent(db):
     agent_id = _create_agent()
     schedule_id = _create_schedule("A", [])

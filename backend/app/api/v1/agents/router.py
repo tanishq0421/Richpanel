@@ -11,9 +11,9 @@ router = APIRouter(prefix="/api/v1/agents", tags=["agents"])
 
 
 @router.get("", response_model=list[AgentResponse])
-def list_agents(pagination: PaginationParams = Depends()):
+def list_agents(q: str | None = None, pagination: PaginationParams = Depends()):
     with db_session_read() as session:
-        agents = agents_queries.list_agents(session, pagination.limit, pagination.offset)
+        agents = agents_queries.list_agents(session, pagination.limit, pagination.offset, q=q)
         return [AgentResponse(id=a.id, name=a.name, email=a.email) for a in agents]
 
 
