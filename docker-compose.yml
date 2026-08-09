@@ -1,0 +1,125 @@
+# ════════════════════════════════════════════════════════════════════════════
+# Richpanel — full local/dev stack.
+#
+#   cp backend/.env.example  backend/.env
+#   cp frontend/.env.example frontend/.env
+#   docker compose up --build
+#
+# That single command builds the backend image, starts Postgres, waits for it to
+# report healthy, applies Alembic migrations, and serves the API on
+# http://localhost:8000.
+#
+# Three separate containers on three separate ports:
+#   postgres  → localhost:55432
+#   backend   → localhost:8000
+#   frontend  → localhost:5173   (profile `frontend`, see below)
+#
+# Because the frontend is served from its own origin, every browser call to the
+# API is cross-origin — the backend allows it via CORS_ALLOWED_ORIGINS in
+# backend/.env. There is no same-origin reverse proxy by design.
+#
+# ── Why env_file instead of a root .env ────────────────────────────────────
+# Each service owns its own environment file, next to its own code. Note the
+# Compose subtlety this creates: `env_file:` injects variables INTO a container,
+# but does NOT feed `${VAR}` interpolation in this file. So anything Compose
+# itself must resolve — published ports, build args — is written as a literal
+# with a `${VAR:-default}` escape hatch that reads from your SHELL, e.g.
+#     BACKEND_HOST_PORT=9000 docker compose up
+# ════════════════════════════════════════════════════════════════════════════
+
+name: richpanel
+
+services:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Postgres — the stack's own database, fully isolated from any Postgres
+  # already running on the host (different host port, its own named volume).
+  # ──────────────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:17.6-alpine
+    restart: unless-stopped
+    env_file:
+      # POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB. Lives with the backend
+      # because the backend's DATABASE_URL must match these exactly; keeping
+      # them in one file is what stops the two drifting apart.
+      - ./backend/.env
+    ports:
+      # Deliberately NOT 5432 on the host — a developer machine very often has a
+      # local Postgres already bound there. Container-internal port stays 5432.
+      - "${POSTGRES_HOST_PORT:-55432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1 forces a TCP check. The official image runs a temporary,
+      # socket-only server during first-boot initdb; a socket check would report
+      # healthy against that throwaway server and let the backend race ahead.
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -h 127.0.0.1 -p 5432 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\"",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Backend — FastAPI. Migrations run in the entrypoint before uvicorn starts.
+  # ──────────────────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: richpanel-backend:local
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        # Hard ordering gate: the backend container is not created until the
+        # Postgres healthcheck above passes.
+        condition: service_healthy
+    env_file:
+      - ./backend/.env
+    environment:
+      # Fixed inside the container; the host-side port is mapped below.
+      APP_PORT: "8000"
+    ports:
+      - "${BACKEND_HOST_PORT:-8000}:8000"
+    # Healthcheck is baked into backend/Dockerfile (HEALTHCHECK → /health) so it
+    # travels with the image wherever it is deployed, not just under Compose.
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Frontend — NOT built or started by default.
+  #
+  # `profiles` keeps this service out of every default command, so
+  # `docker compose up --build` works today even though ./frontend contains only
+  # a Dockerfile template and an env template. To activate once a real app lands:
+  #
+  #     docker compose --profile frontend up --build
+  #
+  # (or set COMPOSE_PROFILES=frontend in your shell to make it the default).
+  # ──────────────────────────────────────────────────────────────────────────
+  frontend:
+    profiles: ["frontend"]
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Baked in at build time — a static SPA bundle has no runtime env, so
+        # this cannot come from frontend/.env via env_file. Override per build:
+        #   VITE_APP_BASE_URL=https://api.example docker compose build frontend
+        VITE_APP_BASE_URL: ${VITE_APP_BASE_URL:-http://localhost:8000}
+    image: richpanel-frontend:local
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    env_file:
+      - ./frontend/.env
+    ports:
+      - "${FRONTEND_HOST_PORT:-5173}:80"
+
+volumes:
+  # Explicitly named so it is unmistakable in `docker volume ls` and can never
+  # be confused with another project's data. Survives `docker compose down`;
+  # only `docker compose down -v` (or an explicit `docker volume rm`) destroys it.
+  pgdata:
+    name: richpanel_pgdata

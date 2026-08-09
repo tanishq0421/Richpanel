@@ -1,0 +1,54 @@
+# Build context = ./backend. Everything listed here is excluded before the
+# daemon ever sees it: smaller context, faster builds, no host artefacts or
+# secrets leaking into layers.
+
+# ── Local virtualenv (uv creates backend/.venv) ─────────────────────────────
+# Critically important: the host venv is macOS/arm64 and would both bloat the
+# context by hundreds of MB and shadow the venv built inside the image.
+.venv/
+venv/
+ENV/
+
+# ── Python bytecode & tool caches ───────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+*.egg-info/
+
+# ── Tests: not needed to serve traffic ──────────────────────────────────────
+# The runtime image is not a test runner. Run the suite on the host or in CI
+# with `uv run pytest`; `uv sync --frozen --no-dev` omits pytest anyway, so
+# shipping these files would only add dead weight.
+tests/
+
+# ── VCS / editor / OS noise ─────────────────────────────────────────────────
+.git/
+.gitignore
+.github/
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*~
+
+# ── Secrets and local env files: never bake these into an image layer ───────
+.env
+.env.*
+
+# ── Docs / logs ─────────────────────────────────────────────────────────────
+*.md
+!README.md
+*.log
+
+# ── Build recipe itself: read by the daemon directly, no need to ship it ─────
+# (docker-entrypoint.sh must NOT be listed here — it is the container's PID 1.)
+Dockerfile
+.dockerignore

@@ -1,0 +1,57 @@
+# Build context = ./frontend. Ready for the frontend application that has not
+# landed yet — see frontend/Dockerfile.
+
+# ── Dependencies: reinstalled inside the image from the lockfile ────────────
+# Never ship the host's node_modules: it is the single biggest context bloater
+# and can contain platform-specific native binaries that break in the image.
+node_modules/
+.pnp
+.pnp.js
+.yarn/
+
+# ── Build output: produced by the build stage, never copied in ──────────────
+dist/
+dist-ssr/
+build/
+out/
+.next/
+.nuxt/
+.svelte-kit/
+.vite/
+.turbo/
+coverage/
+
+# ── Tests: not needed to produce a production bundle ────────────────────────
+# (Remove these lines if your build step type-checks or lints test files.)
+**/*.test.*
+**/*.spec.*
+__tests__/
+e2e/
+cypress/
+playwright-report/
+test-results/
+
+# ── VCS / editor / OS noise ─────────────────────────────────────────────────
+.git/
+.gitignore
+.github/
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*~
+
+# ── Secrets and local env files: never bake these into an image layer ───────
+.env
+.env.*
+
+# ── Docs / logs ─────────────────────────────────────────────────────────────
+*.md
+*.log
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Keep the Dockerfile itself out of the copied source tree.
+Dockerfile
+.dockerignore
