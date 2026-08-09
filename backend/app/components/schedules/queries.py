@@ -1,11 +1,11 @@
 # backend/app/components/schedules/queries.py
-from datetime import date, datetime
+from datetime import date
 
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session
 
 from app.components.schedules.model import Schedule, ScheduleWeekdayHours
-from app.domain.types import IST, WeekdayShift
+from app.domain.types import WeekdayShift
 
 # Postgres keeps single-key and key-pair advisory locks in two separate spaces,
 # so pg_advisory_xact_lock(SCHEDULE_LOCK_NAMESPACE, schedule_id) can never
@@ -61,8 +61,18 @@ def touch_schedule(session: Session, schedule_id: int) -> None:
     Needed because editing weekday hours rewrites rows in
     schedule_weekday_hours and never issues an UPDATE against schedules -- so
     the column's onupdate can never fire, and 'last modified' would stay at the
-    creation time no matter how often the hours changed."""
-    session.execute(update(Schedule).where(Schedule.id == schedule_id).values(updated_at=datetime.now(IST)))
+    creation time no matter how often the hours changed.
+
+    Uses func.now() -- the DATABASE's clock -- deliberately, not
+    datetime.now(IST) (the application process's clock). The column's own
+    onupdate=func.now() (model.py) already uses the DB clock; mixing the two
+    sources for one audit column means whichever write is on the losing side of
+    real host/DB clock skew can move updated_at BACKWARDS. This was proven, not
+    theoretical: under measured skew in the documented local-dev setup (backend
+    on host, Postgres in Docker), the app-clock write landed earlier than a
+    prior DB-clock write and failed the ordering assertion in
+    test_touch_schedule_moves_updated_at_past_created_at."""
+    session.execute(update(Schedule).where(Schedule.id == schedule_id).values(updated_at=func.now()))
 
 
 def update_schedule_attributes(session: Session, schedule: Schedule, values: dict[str, object]) -> None:
@@ -81,7 +91,8 @@ def update_schedule_attributes(session: Session, schedule: Schedule, values: dic
 
 
 def soft_delete_schedule(session: Session, schedule_id: int) -> None:
-    session.execute(update(Schedule).where(Schedule.id == schedule_id).values(deleted_at=datetime.now(IST)))
+    # func.now(): same DB-clock rationale as touch_schedule above.
+    session.execute(update(Schedule).where(Schedule.id == schedule_id).values(deleted_at=func.now()))
 
 
 def insert_weekday_hours_rows(session: Session, schedule_id: int, shifts: list[WeekdayShift]) -> None:
@@ -118,8 +129,9 @@ def replace_weekday_hours_rows(session: Session, schedule_id: int, shifts: list[
 
 
 def soft_delete_weekday_hours_for_schedule(session: Session, schedule_id: int) -> None:
+    # func.now(): same DB-clock rationale as touch_schedule above.
     session.execute(
         update(ScheduleWeekdayHours)
         .where(ScheduleWeekdayHours.schedule_id == schedule_id, ScheduleWeekdayHours.deleted_at.is_(None))
-        .values(deleted_at=datetime.now(IST))
+        .values(deleted_at=func.now())
     )

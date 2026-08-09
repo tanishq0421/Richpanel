@@ -1,11 +1,8 @@
 # backend/app/components/schedule_agents/queries.py
-from datetime import datetime
-
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.components.schedule_agents.model import ScheduleAgent
-from app.domain.types import IST
 
 
 def create_assignment(session: Session, schedule_id: int, agent_id: int) -> ScheduleAgent:
@@ -16,6 +13,10 @@ def create_assignment(session: Session, schedule_id: int, agent_id: int) -> Sche
 
 
 def soft_delete_assignment(session: Session, schedule_id: int, agent_id: int) -> None:
+    # func.now(): the DB's clock, not the app process's -- matches the model's
+    # own onupdate=func.now() on this table. Two clock sources for one audit
+    # column let a write land "before" an earlier one under real host/DB skew;
+    # see schedules.queries.touch_schedule for the proven failure mode.
     session.execute(
         update(ScheduleAgent)
         .where(
@@ -23,7 +24,7 @@ def soft_delete_assignment(session: Session, schedule_id: int, agent_id: int) ->
             ScheduleAgent.agent_id == agent_id,
             ScheduleAgent.deleted_at.is_(None),
         )
-        .values(deleted_at=datetime.now(IST))
+        .values(deleted_at=func.now())
     )
 
 
@@ -46,8 +47,9 @@ def get_other_active_schedule_ids_for_agent(
 
 
 def soft_delete_assignments_for_schedule(session: Session, schedule_id: int) -> None:
+    # func.now(): same DB-clock rationale as soft_delete_assignment above.
     session.execute(
         update(ScheduleAgent)
         .where(ScheduleAgent.schedule_id == schedule_id, ScheduleAgent.deleted_at.is_(None))
-        .values(deleted_at=datetime.now(IST))
+        .values(deleted_at=func.now())
     )
