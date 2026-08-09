@@ -6,7 +6,7 @@ import { DeletionImpactModal } from '@/components/modals'
 import { useSchedule } from '@/hooks/queries'
 
 import { AssigneeList } from './AssigneeList'
-import { ScheduleHoursForm } from './ScheduleForm'
+import { ScheduleEditForm } from './ScheduleForm'
 import { coveredDayCount, formatEffectiveRange } from './ScheduleList'
 
 export function ScheduleDetail({ scheduleId, onDeleted }: { scheduleId: number; onDeleted: () => void }) {
@@ -68,7 +68,7 @@ export function ScheduleDetail({ scheduleId, onDeleted }: { scheduleId: number; 
         </div>
       </Card>
 
-      <ScheduleHoursForm schedule={data} />
+      <ScheduleEditForm schedule={data} />
 
       <AssigneeList scheduleId={data.id} />
 

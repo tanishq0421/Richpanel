@@ -24,6 +24,24 @@ export interface ScheduleDTO {
   shifts: ShiftDTO[]
 }
 
+/**
+ * `PUT /schedules/{id}` body. `shifts` is always required; `name`/`start_date`/
+ * `end_date` are a partial update — a key that is OMITTED from the object
+ * means "leave this field unchanged," while `end_date: null` explicitly means
+ * "clear it, make the schedule ongoing." Those are different states on the
+ * wire, and `end_date?: string | null` is enough to keep them distinguishable
+ * without any extra serialization step: `JSON.stringify` already drops a key
+ * whose value is `undefined` (the "don't set this property" case) while
+ * keeping an explicit `null`, so a caller only has to leave the key off the
+ * object to mean "unchanged" and set it to `null` to mean "ongoing."
+ */
+export interface UpdateScheduleRequest {
+  name?: string
+  start_date?: string
+  end_date?: string | null
+  shifts: ShiftDTO[]
+}
+
 export interface AgentDTO {
   id: number
   name: string

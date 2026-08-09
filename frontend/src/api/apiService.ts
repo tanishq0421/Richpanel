@@ -9,6 +9,7 @@ import type {
   ScheduleDTO,
   ScheduleSummaryDTO,
   ShiftDTO,
+  UpdateScheduleRequest,
 } from './types'
 
 /**
@@ -20,8 +21,12 @@ import type {
  */
 class ApiService {
   readonly agents = {
-    list: (params: PaginationParams = {}) =>
-      request<AgentDTO[]>(`/api/v1/agents${query({ limit: params.limit, offset: params.offset })}`),
+    /** `q` is an optional server-side name/email filter (`ILIKE`) -- the
+     *  directory can run into the thousands, and a fixed page limit alone
+     *  cannot make an agent past the first page findable; search is what
+     *  reaches the rest of it without paging through everyone in between. */
+    list: (params: PaginationParams & { q?: string } = {}) =>
+      request<AgentDTO[]>(`/api/v1/agents${query({ limit: params.limit, offset: params.offset, q: params.q })}`),
 
     schedulesFor: (agentId: number) => request<ScheduleSummaryDTO[]>(`/api/v1/agents/${agentId}/schedules`),
   }
@@ -35,9 +40,12 @@ class ApiService {
     create: (input: { name: string; start_date: string; end_date: string | null; shifts: ShiftDTO[] }) =>
       request<ScheduleDTO>('/api/v1/schedules', { method: 'POST', body: JSON.stringify(input) }),
 
-    /** Hours only — name and dates are not editable through the API today. */
-    updateHours: (id: number, shifts: ShiftDTO[]) =>
-      request<ScheduleDTO>(`/api/v1/schedules/${id}`, { method: 'PUT', body: JSON.stringify({ shifts }) }),
+    /** Partial update: `name`/`start_date`/`end_date` are optional and left
+     *  unchanged if omitted; `shifts` is always required. See
+     *  `UpdateScheduleRequest` for how "unchanged" and "cleared" stay
+     *  distinguishable on the wire. */
+    update: (id: number, input: UpdateScheduleRequest) =>
+      request<ScheduleDTO>(`/api/v1/schedules/${id}`, { method: 'PUT', body: JSON.stringify(input) }),
 
     /** Who loses coverage if this schedule is deleted. Must be shown to the
      *  user BEFORE they confirm — deleting silently can zero out coverage for

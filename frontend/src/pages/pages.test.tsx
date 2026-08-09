@@ -7,10 +7,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ApiError } from '@/api/http'
 import type { ReportDTO, ScheduleDTO } from '@/api/types'
+import { ToastProvider } from '@/context/ToastContext'
 import { toIsoDate } from '@/helpers/time'
 
 import { AgentHoursTable } from './reports/AgentHoursTable'
 import { ReportForm } from './reports/ReportForm'
+import { ScheduleDetail } from './schedules/ScheduleDetail'
+import { ScheduleList } from './schedules/ScheduleList'
 import { SchedulesPage } from './schedules/SchedulesPage'
 
 /**
@@ -49,6 +52,7 @@ const h = vi.hoisted(() => {
         message appeared. */
     createMutate: vi.fn(),
     generateMutate: vi.fn(),
+    updateMutate: vi.fn(),
     state: {
       schedules: stub([]),
       schedule: stub(undefined),
@@ -61,6 +65,8 @@ const h = vi.hoisted(() => {
       created: { id: 7 } as unknown,
       generateError: null as unknown,
       generated: { id: 4 } as unknown,
+      updateError: null as unknown,
+      updated: { id: 1 } as unknown,
     },
   }
 })
@@ -104,7 +110,25 @@ vi.mock('@/hooks/mutations', async (importOriginal) => {
         },
       }
     },
-    useUpdateScheduleHours: inert,
+    // Stateful for the same reason as create: a 422/400 has to re-render the
+    // form still holding what the user chose, which is the point of the
+    // edit-form error tests.
+    useUpdateSchedule: () => {
+      const [error, setError] = useState<unknown>(null)
+      return {
+        error,
+        isPending: false,
+        reset: () => setError(null),
+        mutate: (input: unknown, options?: { onSuccess?: (schedule: unknown) => void }) => {
+          h.updateMutate(input)
+          if (h.state.updateError) {
+            setError(h.state.updateError)
+            return
+          }
+          options?.onSuccess?.(h.state.updated)
+        },
+      }
+    },
     useUnassignAgent: inert,
     useAssignAgent: inert,
     useDeleteSchedule: inert,
@@ -223,7 +247,9 @@ function renderPage(ui: ReactElement, path = '/schedules') {
   })
   return render(
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={[path]}>{ui}</MemoryRouter>
+      <ToastProvider>
+        <MemoryRouter initialEntries={[path]}>{ui}</MemoryRouter>
+      </ToastProvider>
     </QueryClientProvider>,
   )
 }
@@ -259,8 +285,11 @@ beforeEach(() => {
   h.state.created = { id: 7 }
   h.state.generateError = null
   h.state.generated = { id: 4 }
+  h.state.updateError = null
+  h.state.updated = { id: 1 }
   h.createMutate.mockClear()
   h.generateMutate.mockClear()
+  h.updateMutate.mockClear()
 })
 
 describe('SchedulesPage', () => {
@@ -461,6 +490,178 @@ describe('SchedulesPage', () => {
     // Still there to be corrected, not silently discarded.
     expect(screen.getByText(`Ends = ${h.stamp(h.today)}`)).toBeInTheDocument()
     expect(h.createMutate).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * `ScheduleEditForm`, rendered through `ScheduleDetail` the way the app
+ * actually mounts it. Name, dates and hours are all editable here — see the
+ * component's own doc comment for how "only send what changed" and the
+ * elapsed-`start_date` lock fall out of the same diff-against-`schedule`
+ * mechanism.
+ */
+describe('ScheduleEditForm', () => {
+  // Five days out: far enough that `h.later` (today + 30) is a genuinely
+  // different future date, so "edit the start date" is a real change rather
+  // than resubmitting what was already there.
+  const FUTURE_START_DATE = new Date(h.today.getFullYear(), h.today.getMonth(), h.today.getDate() + 5)
+
+  const FUTURE_SCHEDULE: ScheduleDTO = {
+    id: 30,
+    name: 'Future shift',
+    start_date: toIsoDate(FUTURE_START_DATE),
+    end_date: null,
+    shifts: [{ weekday: 0, start_hours: 9, end_hours: 17 }],
+  }
+
+  it('edits a not-yet-started schedule to a new future start date', async () => {
+    const user = userEvent.setup()
+    h.state.schedule = { data: FUTURE_SCHEDULE, isLoading: false, error: null, refetch: () => {} }
+
+    renderPage(<ScheduleDetail scheduleId={FUTURE_SCHEDULE.id} onDeleted={() => {}} />)
+
+    // Not locked: the editable picker double is present, not the read-only field.
+    expect(screen.getByText(`Starts = ${h.stamp(FUTURE_START_DATE)}`)).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'set Starts later' }))
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    expect(h.updateMutate).toHaveBeenCalledWith(
+      expect.objectContaining({ id: FUTURE_SCHEDULE.id, start_date: toIsoDate(h.later) }),
+    )
+  })
+
+  it('locks the start date once a schedule has already started, with no control to submit a change', () => {
+    // SCHEDULE.start_date is 2024-03-01 — long elapsed.
+    h.state.schedule = { data: SCHEDULE, isLoading: false, error: null, refetch: () => {} }
+
+    renderPage(<ScheduleDetail scheduleId={SCHEDULE.id} onDeleted={() => {}} />)
+
+    const startField = screen.getByLabelText('Starts')
+    expect(startField).toBeDisabled()
+    expect(screen.getByText(/already started/i)).toBeInTheDocument()
+    // The editable picker double for Starts must not be rendered at all —
+    // this is not just visually disabled, there is nothing to click.
+    expect(screen.queryByRole('button', { name: 'set Starts today' })).not.toBeInTheDocument()
+  })
+
+  it('clears the end date via the ongoing affordance', async () => {
+    const user = userEvent.setup()
+    const scheduleWithEnd: ScheduleDTO = { ...FUTURE_SCHEDULE, id: 31, end_date: toIsoDate(h.later) }
+    h.state.schedule = { data: scheduleWithEnd, isLoading: false, error: null, refetch: () => {} }
+
+    renderPage(<ScheduleDetail scheduleId={31} onDeleted={() => {}} />)
+
+    await user.click(screen.getByRole('button', { name: 'clear Ends' }))
+    expect(screen.getByText('Ends = empty')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    // `null` is a real value here — the schedule runs indefinitely.
+    expect(h.updateMutate).toHaveBeenCalledWith(expect.objectContaining({ id: 31, end_date: null }))
+  })
+
+  it('shows a banner for a body-level 422 on edit and keeps what was typed', async () => {
+    const user = userEvent.setup()
+    h.state.schedule = { data: FUTURE_SCHEDULE, isLoading: false, error: null, refetch: () => {} }
+    h.state.updateError = new ApiError('validation', 422, 'validation_error', 'request validation failed', [
+      { field: 'body', message: 'end_date must be on or after start_date', type: 'value_error' },
+    ])
+
+    renderPage(<ScheduleDetail scheduleId={FUTURE_SCHEDULE.id} onDeleted={() => {}} />)
+
+    const nameInput = screen.getByLabelText(/schedule name/i)
+    await user.clear(nameInput)
+    await user.type(nameInput, 'Renamed while failing')
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    expect(await screen.findByText('end_date must be on or after start_date')).toBeInTheDocument()
+    expect(nameInput).toHaveValue('Renamed while failing')
+  })
+
+  it('surfaces a 400 bad-request error (an elapsed start_date race) as a visible message', async () => {
+    const user = userEvent.setup()
+    h.state.schedule = { data: FUTURE_SCHEDULE, isLoading: false, error: null, refetch: () => {} }
+    // kind 'bad_request', not 'validation' — a different branch of the same
+    // error-handling than the 422 test above, and both must be covered.
+    h.state.updateError = new ApiError(
+      'bad_request',
+      400,
+      'validation_error',
+      'start_date has already begun and can no longer be changed.',
+    )
+
+    renderPage(<ScheduleDetail scheduleId={FUTURE_SCHEDULE.id} onDeleted={() => {}} />)
+
+    await user.click(screen.getByRole('button', { name: 'set Starts later' }))
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    expect(
+      await screen.findByText('start_date has already begun and can no longer be changed.'),
+    ).toBeInTheDocument()
+  })
+
+  it('renames a schedule and reflects the new name in both list and detail after saving', async () => {
+    const user = userEvent.setup()
+    h.state.schedule = { data: SCHEDULE, isLoading: false, error: null, refetch: () => {} }
+    h.state.schedules = { data: [SCHEDULE], isLoading: false, error: null, refetch: () => {} }
+
+    function ListAndDetail() {
+      return (
+        <>
+          <ScheduleList
+            schedules={h.state.schedules.data as ScheduleDTO[]}
+            isLoading={false}
+            error={null}
+            onRetry={() => {}}
+            selectedId={SCHEDULE.id}
+            onCreate={() => {}}
+          />
+          <ScheduleDetail scheduleId={SCHEDULE.id} onDeleted={() => {}} />
+        </>
+      )
+    }
+
+    // Built by hand rather than through `renderPage`: this test calls
+    // `rerender` itself (to stand in for the re-render a real cache
+    // invalidation + refetch would trigger), and `renderPage` does not expose
+    // the `render` result it wraps.
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+    const wrap = () => (
+      <QueryClientProvider client={client}>
+        <ToastProvider>
+          <MemoryRouter initialEntries={['/schedules']}>
+            <ListAndDetail />
+          </MemoryRouter>
+        </ToastProvider>
+      </QueryClientProvider>
+    )
+
+    const { rerender } = render(wrap())
+
+    expect(screen.getAllByText('India support — weekdays').length).toBeGreaterThan(0)
+
+    const nameInput = screen.getByLabelText(/schedule name/i)
+    await user.clear(nameInput)
+    await user.type(nameInput, 'Night shift renamed')
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    expect(h.updateMutate).toHaveBeenCalledWith(
+      expect.objectContaining({ id: SCHEDULE.id, name: 'Night shift renamed' }),
+    )
+    expect(screen.getByText('All changes saved')).toBeInTheDocument()
+
+    // Stands in for what a real cache invalidation + refetch would produce —
+    // `useSchedule`/`useSchedules` are stubbed reads, not a live subscription,
+    // so nothing re-renders on its own until this happens.
+    const renamed: ScheduleDTO = { ...SCHEDULE, name: 'Night shift renamed' }
+    h.state.schedule = { data: renamed, isLoading: false, error: null, refetch: () => {} }
+    h.state.schedules = { data: [renamed], isLoading: false, error: null, refetch: () => {} }
+
+    rerender(wrap())
+
+    expect(screen.getAllByText('Night shift renamed').length).toBeGreaterThan(0)
+    expect(screen.queryByText('India support — weekdays')).not.toBeInTheDocument()
   })
 })
 
