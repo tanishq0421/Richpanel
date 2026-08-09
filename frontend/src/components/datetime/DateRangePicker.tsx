@@ -1,6 +1,6 @@
 import { useId, useState } from 'react'
 import * as Popover from '@radix-ui/react-popover'
-import { DayPicker, type ClassNames } from 'react-day-picker'
+import { DayPicker, type ClassNames, type Matcher } from 'react-day-picker'
 import { format, startOfDay } from 'date-fns'
 import { cn } from '@/lib/cn'
 import { Button } from '@/components/ui'
@@ -30,15 +30,37 @@ const RANGE_CLASS_NAMES: Partial<ClassNames> = {
     'bg-[var(--color-brand-100)] [&>button]:rounded-none! [&>button]:bg-transparent! [&>button]:font-normal! [&>button]:text-[var(--color-brand-700)]!',
 }
 
+/**
+ * Note before reaching for this: react-day-picker's range mode restarts the
+ * selection once a range is complete — the next click sets `from` to the day
+ * clicked and drops `to`. That is right for "pick a window" gestures and wrong
+ * wherever the two ends are separate, individually-editable fields, because a
+ * stray click silently discards `to`. `ScheduleForm` hit exactly that (a null
+ * `end_date` there means "ongoing", so the click changed the schedule's
+ * meaning) and now composes two `DatePicker`s instead. Nothing in the app
+ * renders this component today.
+ */
 export interface DateRangePickerProps {
   from: Date | null
   to: Date | null
   onChange: (r: { from: Date | null; to: Date | null }) => void
   label?: string
   error?: string
+  /** Earliest selectable day, inclusive — the bound itself stays pickable. */
+  minDate?: Date
+  /** Latest selectable day, inclusive. */
+  maxDate?: Date
 }
 
-export function DateRangePicker({ from, to, onChange, label, error }: DateRangePickerProps) {
+export function DateRangePicker({
+  from,
+  to,
+  onChange,
+  label,
+  error,
+  minDate,
+  maxDate,
+}: DateRangePickerProps) {
   const generatedId = useId()
   const triggerId = `range-${generatedId}`
   const labelId = `${triggerId}-label`
@@ -47,6 +69,20 @@ export function DateRangePicker({ from, to, onChange, label, error }: DateRangeP
 
   const [open, setOpen] = useState(false)
   const [month, setMonth] = useState<Date>(from ?? new Date())
+
+  /**
+   * Same shape as `DatePicker`'s. `before`/`after` are exclusive, so passing
+   * `startOfDay(minDate)` leaves the bound day itself selectable — a schedule
+   * starting *today* is allowed, only yesterday is not.
+   *
+   * Handed to react-day-picker rather than checked in `onSelect`, so a day out
+   * of range is genuinely unreachable: `disabled` sets `disabled` on the day
+   * button (no click, no keyboard landing, skipped by the roving tabindex),
+   * not merely rejected once pressed.
+   */
+  const disabled: Matcher[] = []
+  if (minDate) disabled.push({ before: startOfDay(minDate) })
+  if (maxDate) disabled.push({ after: startOfDay(maxDate) })
 
   function handleOpenChange(next: boolean) {
     setOpen(next)
@@ -117,6 +153,9 @@ export function DateRangePicker({ from, to, onChange, label, error }: DateRangeP
                 // to come, and an open-ended range is closed deliberately.
                 if (picked.from && picked.to) setOpen(false)
               }}
+              disabled={disabled}
+              startMonth={minDate}
+              endMonth={maxDate}
               weekStartsOn={1}
               classNames={RANGE_CLASS_NAMES}
             />

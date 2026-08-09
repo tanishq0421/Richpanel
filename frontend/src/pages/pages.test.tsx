@@ -7,6 +7,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ApiError } from '@/api/http'
 import type { ReportDTO, ScheduleDTO } from '@/api/types'
+import { toIsoDate } from '@/helpers/time'
 
 import { AgentHoursTable } from './reports/AgentHoursTable'
 import { SchedulesPage } from './schedules/SchedulesPage'
@@ -22,7 +23,19 @@ import { SchedulesPage } from './schedules/SchedulesPage'
  */
 const h = vi.hoisted(() => {
   const stub = (data: unknown) => ({ data, isLoading: false, error: null as unknown, refetch: () => {} })
+  const now = new Date()
   return {
+    /* Built from local date fields rather than an ISO string: the form's floor
+       is `startOfToday()`, and a UTC round trip would land this on yesterday
+       for the first 5h30m of every IST morning and fail the suite overnight. */
+    today: new Date(now.getFullYear(), now.getMonth(), now.getDate()),
+    past: new Date(2024, 2, 1),
+    /* Day-of-month overflow normalises, so this stays a real local date. */
+    later: new Date(now.getFullYear(), now.getMonth(), now.getDate() + 30),
+    stamp: (d: Date) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`,
+    /** Lets a test assert the mutation was never reached, not just that a
+        message appeared. */
+    createMutate: vi.fn(),
     state: {
       schedules: stub([]),
       schedule: stub(undefined),
@@ -66,7 +79,8 @@ vi.mock('@/hooks/mutations', async (importOriginal) => {
         error,
         isPending: false,
         reset: () => setError(null),
-        mutate: (_input: unknown, options?: { onSuccess?: (schedule: unknown) => void }) => {
+        mutate: (input: unknown, options?: { onSuccess?: (schedule: unknown) => void }) => {
+          h.createMutate(input)
           if (h.state.createError) {
             setError(h.state.createError)
             return
@@ -83,23 +97,40 @@ vi.mock('@/hooks/mutations', async (importOriginal) => {
   }
 })
 
+/**
+ * One stub serves both date fields, with every control namespaced by the
+ * field's label. That is the point: the form now owns two independent dates,
+ * so the double has to be able to drive one without touching the other — which
+ * is exactly the regression these tests exist to catch.
+ *
+ * `value` and `minDate` are rendered as text so a test can assert what each
+ * field actually holds and what floor it was handed, rather than inferring it.
+ */
 vi.mock('@/components/datetime', () => ({
-  DatePicker: () => null,
   DateTimeField: () => null,
-  DateRangePicker: ({
-    from,
+  DateRangePicker: () => null,
+  DatePicker: ({
+    value,
     onChange,
+    label,
     error,
+    minDate,
   }: {
-    from: Date | null
-    onChange: (range: { from: Date | null; to: Date | null }) => void
+    value: Date | null
+    onChange: (d: Date | null) => void
+    label?: string
     error?: string
+    minDate?: Date
   }) => (
     <div>
-      <button type="button" onClick={() => onChange({ from: new Date(2024, 2, 1), to: null })}>
-        set dates
-      </button>
-      <span>{from ? 'dates set' : 'dates unset'}</span>
+      <span>{`${label} = ${value ? h.stamp(value) : 'empty'}`}</span>
+      <span>{`${label} floor ${minDate ? h.stamp(minDate) : 'none'}`}</span>
+      <button type="button" onClick={() => onChange(h.today)}>{`set ${label} today`}</button>
+      {/* Stands in for a value that went stale after the calendar closed — the
+          real picker no longer offers this day. */}
+      <button type="button" onClick={() => onChange(h.past)}>{`set ${label} past`}</button>
+      <button type="button" onClick={() => onChange(h.later)}>{`set ${label} later`}</button>
+      <button type="button" onClick={() => onChange(null)}>{`clear ${label}`}</button>
       {error ? <span>{error}</span> : null}
     </div>
   ),
@@ -149,6 +180,7 @@ beforeEach(() => {
   h.state.reportRows = []
   h.state.createError = null
   h.state.created = { id: 7 }
+  h.createMutate.mockClear()
 })
 
 describe('SchedulesPage', () => {
@@ -206,7 +238,7 @@ describe('SchedulesPage', () => {
 
     const name = screen.getByLabelText(/schedule name/i)
     await user.type(name, 'Night shift')
-    await user.click(screen.getByRole('button', { name: 'set dates' }))
+    await user.click(screen.getByRole('button', { name: 'set Starts today' }))
     await user.click(screen.getByRole('button', { name: 'Create schedule' }))
 
     // The backend's per-field message lands on the control that caused it …
@@ -214,7 +246,120 @@ describe('SchedulesPage', () => {
     expect(name).toHaveAttribute('aria-invalid', 'true')
     // … and the form still holds everything the user entered.
     expect(name).toHaveValue('Night shift')
-    expect(screen.getByText('dates set')).toBeInTheDocument()
+    expect(screen.getByText(`Starts = ${h.stamp(h.today)}`)).toBeInTheDocument()
+  })
+
+  /**
+   * The list has to be non-empty first: the empty state renders a "New
+   * schedule" call to action of its own, and two of them make the query
+   * ambiguous rather than wrong.
+   */
+  async function openCreateForm(user: ReturnType<typeof userEvent.setup>) {
+    h.state.schedules = { data: [SCHEDULE], isLoading: false, error: null, refetch: () => {} }
+    renderPage(<SchedulesPage />)
+    await user.click(screen.getByRole('button', { name: 'New schedule' }))
+  }
+
+  it('floors the start at today, and the end at whatever start was chosen', async () => {
+    const user = userEvent.setup()
+    await openCreateForm(user)
+
+    expect(screen.getByText(`Starts floor ${h.stamp(h.today)}`)).toBeInTheDocument()
+    // Until a start exists the end can only be floored at today too.
+    expect(screen.getByText(`Ends floor ${h.stamp(h.today)}`)).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'set Starts later' }))
+
+    // Picking a start moves the end's floor with it, so an end before the
+    // start is never offered.
+    expect(screen.getByText(`Ends floor ${h.stamp(h.later)}`)).toBeInTheDocument()
+  })
+
+  it('refuses a start date in the past and never reaches the mutation', async () => {
+    const user = userEvent.setup()
+    await openCreateForm(user)
+
+    await user.type(screen.getByLabelText(/schedule name/i), 'Night shift')
+    await user.click(screen.getByRole('button', { name: 'set Starts past' }))
+    await user.click(screen.getByRole('button', { name: 'Create schedule' }))
+
+    expect(await screen.findByText("Schedules can't start in the past.")).toBeInTheDocument()
+    expect(h.createMutate).not.toHaveBeenCalled()
+  })
+
+  it('lets a schedule starting today through', async () => {
+    const user = userEvent.setup()
+    await openCreateForm(user)
+
+    await user.type(screen.getByLabelText(/schedule name/i), 'Night shift')
+    await user.click(screen.getByRole('button', { name: 'set Starts today' }))
+    await user.click(screen.getByRole('button', { name: 'Create schedule' }))
+
+    // The boundary is inclusive: today is not "the past".
+    expect(screen.queryByText("Schedules can't start in the past.")).not.toBeInTheDocument()
+    expect(h.createMutate).toHaveBeenCalledWith(
+      expect.objectContaining({ start_date: toIsoDate(h.today), end_date: null }),
+    )
+  })
+
+  it('setting an end date leaves the start date alone', async () => {
+    const user = userEvent.setup()
+    await openCreateForm(user)
+
+    await user.type(screen.getByLabelText(/schedule name/i), 'Night shift')
+    await user.click(screen.getByRole('button', { name: 'set Starts today' }))
+    await user.click(screen.getByRole('button', { name: 'set Ends later' }))
+
+    // The whole point of the split: the second date cannot restart the first.
+    expect(screen.getByText(`Starts = ${h.stamp(h.today)}`)).toBeInTheDocument()
+    expect(screen.getByText(`Ends = ${h.stamp(h.later)}`)).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Create schedule' }))
+
+    expect(h.createMutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        start_date: toIsoDate(h.today),
+        end_date: toIsoDate(h.later),
+      }),
+    )
+  })
+
+  it('goes back to ongoing only when the end date is explicitly cleared', async () => {
+    const user = userEvent.setup()
+    await openCreateForm(user)
+
+    await user.type(screen.getByLabelText(/schedule name/i), 'Night shift')
+    await user.click(screen.getByRole('button', { name: 'set Starts today' }))
+    await user.click(screen.getByRole('button', { name: 'set Ends later' }))
+    await user.click(screen.getByRole('button', { name: 'clear Ends' }))
+
+    expect(screen.getByText('Ends = empty')).toBeInTheDocument()
+    // Clearing the end is not allowed to take the start with it.
+    expect(screen.getByText(`Starts = ${h.stamp(h.today)}`)).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Create schedule' }))
+
+    // `null` is a real value here — the schedule runs indefinitely.
+    expect(h.createMutate).toHaveBeenCalledWith(
+      expect.objectContaining({ start_date: toIsoDate(h.today), end_date: null }),
+    )
+  })
+
+  it('says so rather than dropping an end date stranded before a later start', async () => {
+    const user = userEvent.setup()
+    await openCreateForm(user)
+
+    await user.type(screen.getByLabelText(/schedule name/i), 'Night shift')
+    await user.click(screen.getByRole('button', { name: 'set Ends today' }))
+    await user.click(screen.getByRole('button', { name: 'set Starts later' }))
+    await user.click(screen.getByRole('button', { name: 'Create schedule' }))
+
+    expect(
+      await screen.findByText('The end date cannot be before the start date.'),
+    ).toBeInTheDocument()
+    // Still there to be corrected, not silently discarded.
+    expect(screen.getByText(`Ends = ${h.stamp(h.today)}`)).toBeInTheDocument()
+    expect(h.createMutate).not.toHaveBeenCalled()
   })
 })
 

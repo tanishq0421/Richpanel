@@ -1,5 +1,6 @@
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { startOfToday } from 'date-fns'
 import { timeOptions } from '@/helpers/time'
 import { DatePicker } from './DatePicker'
 import { DateRangePicker } from './DateRangePicker'
@@ -145,6 +146,86 @@ describe('DateRangePicker', () => {
     await user.click(screen.getByRole('button', { name: 'No end date' }))
 
     expect(onChange).toHaveBeenCalledWith({ from: MARCH_10, to: null })
+  })
+
+  /**
+   * A schedule may not take effect in the past, which is expressed as
+   * `minDate={startOfToday()}`. The clock is pinned so that "today" is a
+   * specific, assertable cell and so the day aria-labels stay stable.
+   *
+   * Only `Date` is faked: user-event drives its own timers, and replacing
+   * `setTimeout` here would hang every interaction below.
+   */
+  describe('with a minDate', () => {
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['Date'] })
+      vi.setSystemTime(new Date(2025, 2, 10, 9, 30))
+    })
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    async function openCalendar(onChange: (r: { from: Date | null; to: Date | null }) => void) {
+      const user = userEvent.setup()
+      render(
+        <DateRangePicker
+          from={null}
+          to={null}
+          onChange={onChange}
+          label="Active window"
+          minDate={startOfToday()}
+        />,
+      )
+      await user.click(screen.getByRole('button', { name: /active window/i }))
+      await screen.findByRole('dialog')
+      return user
+    }
+
+    it('makes an earlier day unselectable, not merely rejected after the click', async () => {
+      const onChange = vi.fn()
+      const user = await openCalendar(onChange)
+
+      const yesterday = screen.getByRole('button', { name: /March 9th, 2025/ })
+      expect(yesterday).toBeDisabled()
+
+      await user.click(yesterday)
+
+      expect(onChange).not.toHaveBeenCalled()
+    })
+
+    it('leaves the boundary day itself selectable — today is allowed', async () => {
+      const onChange = vi.fn()
+      const user = await openCalendar(onChange)
+
+      const today = screen.getByRole('button', { name: /March 10th, 2025/ })
+      expect(today).toBeEnabled()
+
+      await user.click(today)
+
+      expect(onChange).toHaveBeenCalledTimes(1)
+      // Local fields, never UTC — the wall-clock day has to survive the trip.
+      const picked = onChange.mock.calls[0][0].from as Date
+      expect([picked.getFullYear(), picked.getMonth(), picked.getDate()]).toEqual([2025, 2, 10])
+    })
+
+    it('cannot be talked into a past day by keyboard either', async () => {
+      const onChange = vi.fn()
+      const user = await openCalendar(onChange)
+
+      const today = screen.getByRole('button', { name: /March 10th, 2025/ })
+      await waitFor(() => expect(today).toHaveFocus())
+
+      // One step left is the disabled 9 March, so the roving tabindex has
+      // nowhere to go — greying the day is not the whole of it, the day is
+      // genuinely out of reach.
+      await user.keyboard('{ArrowLeft}')
+      expect(today).toHaveFocus()
+
+      await user.keyboard('{Enter}')
+      const picked = onChange.mock.calls[0][0].from as Date
+      expect([picked.getFullYear(), picked.getMonth(), picked.getDate()]).toEqual([2025, 2, 10])
+    })
   })
 })
 

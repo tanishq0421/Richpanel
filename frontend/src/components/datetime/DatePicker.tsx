@@ -71,7 +71,16 @@ export const CALENDAR_CLASS_NAMES: Partial<ClassNames> = {
   selected:
     '[&>button]:bg-[var(--color-brand)] [&>button]:text-white [&>button]:hover:bg-[var(--color-brand-700)]',
   outside: '[&>button]:text-[var(--color-ink-400)]',
-  disabled: '[&>button]:text-[var(--color-ink-400)] [&>button]:opacity-45',
+  /**
+   * Once a whole leading stretch of the month can be out of range (a schedule
+   * cannot start in the past), disabled days stop being a rare edge and become
+   * most of the grid — they still have to be *readable* while browsing.
+   * `ink-400` at 45% opacity landed near 1.6:1 on `--color-surface`, so the
+   * colour is `ink-500` at full strength (~4.9:1, AA for body text) and the
+   * unavailability is carried by the strike-through rather than by colour
+   * alone, which is also what keeps it off WCAG 1.4.1.
+   */
+  disabled: '[&>button]:text-[var(--color-ink-500)] [&>button]:line-through',
   hidden: 'invisible',
 }
 

@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react'
+import { startOfToday } from 'date-fns'
 
 import { ApiError } from '@/api/http'
 import type { ScheduleDTO, ShiftDTO } from '@/api/types'
 import { ConflictBanner } from '@/components/feedback'
 import { Button, Card, Input } from '@/components/ui'
-import { DateRangePicker } from '@/components/datetime'
+import { DatePicker } from '@/components/datetime'
 // Imported from the module rather than the barrel: `components/datetime/index.ts`
 // does not re-export it yet.
 import { WeeklyHoursEditor } from '@/components/datetime/WeeklyHoursEditor'
@@ -43,6 +44,35 @@ function SubmitError({ error, onDismiss }: { error: unknown; onDismiss: () => vo
 
 // ── Create ────────────────────────────────────────────────────────────────────
 
+/**
+ * A new schedule cannot take effect before today — there is no changing hours
+ * that have already been worked. Today itself is fine.
+ *
+ * Computed from local date fields (`startOfToday`), never `Date.UTC` or
+ * `toISOString()`: every time in this product is IST, and a UTC round trip
+ * would shift the boundary back a day and reject a schedule starting today for
+ * the first 5h30m of every morning.
+ */
+const PAST_START_MESSAGE = "Schedules can't start in the past."
+
+/**
+ * Two fields rather than one range calendar, deliberately.
+ *
+ * `start_date` and `end_date` are separate fields on the API and mean different
+ * things, and a null `end_date` is not a half-finished input — it is the
+ * schedule running indefinitely. A range calendar cannot express that: it
+ * treats `to` as the second half of a gesture, so clicking once a range is
+ * complete restarts it (`from` = the clicked day, `to` = undefined). Here that
+ * silently rewrote "1 Jan – 31 Mar" into "ongoing", which is a change to what
+ * the schedule *means* and one nobody asked for.
+ *
+ * Splitting the control removes that failure rather than taming it: each date
+ * owns its own state, so changing one cannot clear the other, "ongoing" is
+ * reached only through the end field's own Clear, and the two 422 field errors
+ * finally land on the control that caused them instead of sharing one slot.
+ */
+const ONGOING_PLACEHOLDER = 'Ongoing — no end date'
+
 interface ScheduleCreateFormProps {
   onCreated: (schedule: ScheduleDTO) => void
   onCancel: () => void
@@ -55,28 +85,48 @@ interface ScheduleCreateFormProps {
  */
 export function ScheduleCreateForm({ onCreated, onCancel }: ScheduleCreateFormProps) {
   const [name, setName] = useState('')
-  const [range, setRange] = useState<{ from: Date | null; to: Date | null }>({ from: null, to: null })
+  const [startDate, setStartDate] = useState<Date | null>(null)
+  const [endDate, setEndDate] = useState<Date | null>(null)
   const [shifts, setShifts] = useState<ShiftDTO[]>([])
-  const [localErrors, setLocalErrors] = useState<{ name?: string; range?: string }>({})
+  const [localErrors, setLocalErrors] = useState<{
+    name?: string
+    startDate?: string
+    endDate?: string
+  }>({})
 
   const create = useCreateSchedule()
   const pending = create.isPending
 
+  // Recomputed every render so the calendar's floor follows the clock rather
+  // than the mount time — a form left open overnight must not keep offering
+  // yesterday. The submit guard below re-reads it for the same reason.
+  const earliestStart = startOfToday()
+
   function handleSubmit(event: React.FormEvent) {
     event.preventDefault()
 
-    const next: { name?: string; range?: string } = {}
+    const next: { name?: string; startDate?: string; endDate?: string } = {}
     if (!name.trim()) next.name = 'Give the schedule a name.'
-    if (!range.from) next.range = 'Pick the date this schedule takes effect.'
-    if (range.from && range.to && range.to < range.from) next.range = 'The end date cannot be before the start date.'
+    if (!startDate) next.startDate = 'Pick the date this schedule takes effect.'
+    // Not only enforced by the picker: state can go stale under a tab that was
+    // open when the day rolled over, and the value would then still be sitting
+    // in `startDate` after the calendar has already moved its floor forward.
+    else if (startDate < startOfToday()) next.startDate = PAST_START_MESSAGE
+    // An end before the start is unreachable through the calendar (the end
+    // field's floor is the chosen start), but moving the start forward *after*
+    // choosing an end can strand one — and the answer is to say so, never to
+    // quietly drop the end date the user picked on purpose.
+    if (startDate && endDate && endDate < startDate) {
+      next.endDate = 'The end date cannot be before the start date.'
+    }
     setLocalErrors(next)
     if (Object.keys(next).length > 0) return
 
     create.mutate(
       {
         name: name.trim(),
-        start_date: toIsoDate(range.from as Date),
-        end_date: range.to ? toIsoDate(range.to) : null,
+        start_date: toIsoDate(startDate as Date),
+        end_date: endDate ? toIsoDate(endDate) : null,
         shifts,
       },
       { onSuccess: (schedule: ScheduleDTO) => onCreated(schedule) },
@@ -98,17 +148,34 @@ export function ScheduleCreateForm({ onCreated, onCancel }: ScheduleCreateFormPr
           disabled={pending}
         />
 
-        <DateRangePicker
-          label="Effective dates"
-          from={range.from}
-          to={range.to}
-          onChange={setRange}
-          error={
-            localErrors.range ??
-            fieldError(create.error, 'start_date') ??
-            fieldError(create.error, 'end_date')
-          }
-        />
+        <div className="space-y-1.5">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <DatePicker
+              label="Starts"
+              value={startDate}
+              onChange={setStartDate}
+              minDate={earliestStart}
+              placeholder="Select a start date"
+              error={localErrors.startDate ?? fieldError(create.error, 'start_date')}
+            />
+
+            <DatePicker
+              label="Ends"
+              value={endDate}
+              onChange={setEndDate}
+              /* Floors on the chosen start, so an end before the start is not
+                 offered in the first place; today until a start is picked. */
+              minDate={startDate ?? earliestStart}
+              placeholder={ONGOING_PLACEHOLDER}
+              error={localErrors.endDate ?? fieldError(create.error, 'end_date')}
+            />
+          </div>
+
+          <p className="text-[13px] text-[var(--color-ink-500)]">
+            Leave the end date empty and the schedule runs indefinitely — use Clear in its
+            calendar to go back to ongoing.
+          </p>
+        </div>
 
         <WeeklyHoursEditor
           value={shifts}
