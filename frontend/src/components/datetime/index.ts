@@ -1,5 +1,4 @@
 export { DatePicker, type DatePickerProps } from './DatePicker'
-export { DateRangePicker, type DateRangePickerProps } from './DateRangePicker'
 export { TimePicker, type TimePickerProps } from './TimePicker'
 export { DateTimeField, type DateTimeFieldProps } from './DateTimeField'
 export { WeeklyHoursEditor } from './WeeklyHoursEditor'
