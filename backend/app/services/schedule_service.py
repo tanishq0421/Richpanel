@@ -144,6 +144,18 @@ def _resolve_attribute_changes(
                 "rewriting it would change what already happened. Send the existing "
                 "start_date unchanged, or adjust end_date instead."
             )
+        # This check protects the OTHER direction: the check above confirms the
+        # STORED start_date hasn't begun yet, but says nothing about the NEW
+        # value being requested. Without it, a schedule created for +10 days
+        # could be edited to start -5 days -- "editable only while still in the
+        # future" (the rule this whole feature exists to enforce) held for the
+        # stored value and was silently dropped for the value replacing it.
+        if start_date < today:
+            raise DomainValidationError(
+                f"start_date {start_date.isoformat()} is in the past "
+                f"(today is {today.isoformat()} IST) -- a schedule's start date "
+                "must be today or later."
+            )
         effective_start = start_date
 
     # Compare EFFECTIVE values: either date may be stored rather than sent, so

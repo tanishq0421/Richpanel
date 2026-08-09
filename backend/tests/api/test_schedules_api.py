@@ -218,6 +218,34 @@ def test_a_start_date_of_today_is_already_frozen(db):
     assert _put(schedule_id, start_date=_day(7)).status_code == 400
 
 
+def test_moving_a_future_start_date_into_the_past_is_rejected(db):
+    # The gap a review pass found: the elapsed-check above only protects the
+    # STORED start_date. A schedule that hasn't begun yet (still safely
+    # editable) could previously be given a NEW start_date that is itself in
+    # the past -- silently defeating "editable only while still in the future"
+    # via the value being written, not the value being overwritten.
+    schedule_id = _create_for_edit(start_date=_day(10))
+
+    response = _put(schedule_id, start_date=_day(-5))
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error_code"] == "validation_error"
+    message = response.json()["message"]
+    assert "start_date" in message and "past" in message
+    # Nothing was written.
+    assert client.get(f"/api/v1/schedules/{schedule_id}").json()["start_date"] == _day(10)
+
+
+def test_moving_a_future_start_date_to_today_succeeds(db):
+    # Today is the boundary, not "in the past" -- must remain a valid target.
+    schedule_id = _create_for_edit(start_date=_day(10))
+
+    response = _put(schedule_id, start_date=_day(0))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["start_date"] == _day(0)
+
+
 def test_resending_the_same_elapsed_start_date_alongside_a_new_end_date_succeeds(db):
     # An unchanged field is not a change. A naive implementation rejects this
     # and makes the endpoint unusable for every schedule that has begun --
