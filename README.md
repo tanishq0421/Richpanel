@@ -20,6 +20,10 @@ This tool answers that question. It has exactly two screens:
 | **Schedule Configuration** | Create a schedule — a name, an effective date range, and working hours for each weekday (e.g. Mon–Fri 09:00–17:00). Then assign agents to it. |
 | **Resolution Time Report** | Type in a ticket's start and end time. Get back every agent's **business hours** — the amount of their own scheduled working time that fell inside that window. |
 
+![Schedule Configuration](frontend/public/screenshots/schedule-edit.png)
+
+![Resolution Time Report](frontend/public/screenshots/resolution-report.png)
+
 ### The vocabulary
 
 | Term | Meaning |
@@ -111,7 +115,7 @@ backend/
 | Layer | Exists so that… | Rule |
 |---|---|---|
 | `api/` | HTTP concerns (status codes, JSON shape, pagination params) never leak into business logic. A router body should be 1–3 lines. | May import `services/`. Never touches a session or an ORM model. |
-| `services/` | There is exactly one place that owns a **transaction boundary**. This matters enormously here: the overlap check and the write it guards *must* be the same transaction (§6.6), and that is only enforceable if one layer owns both. | May import `domain/` and `components/`. |
+| `services/` | There is exactly one place that owns a **transaction boundary**. This matters enormously here: the overlap check and the write it guards *must* be the same transaction (§6.2), and that is only enforceable if one layer owns both. | May import `domain/` and `components/`. |
 | `components/` | SQL lives next to the model it queries, so "how do we read schedules" has one answer, not one per caller. | May import `domain/` types. **Never imports `services/`.** |
 | `domain/` | The hardest logic in the system — overnight-shift wrap-around and the closed-form hours math — is unit-testable **with no database at all**. It operates on plain frozen dataclasses, never ORM instances. | **Zero imports from `components/`, `db`, SQLAlchemy, or FastAPI.** |
 
@@ -139,7 +143,7 @@ frontend/src/
 │
 ├── hooks/                       # ══ SERVER STATE — the ONLY place data is fetched ══
 │   ├── queries/                 #   useSchedules, useAgents, useReport, useAssignmentConflicts…
-│   ├── mutations/               #   useCreateSchedule, useAssignAgent, useDeleteSchedule…
+│   ├── mutations/                #   useCreateSchedule, useUpdateSchedule, useAssignAgent…
 │   ├── queryKeys.ts             #   every cache key, in one place
 │   └── useReportRows.ts         #   view-model shaping (joins agents onto report rows)
 │
@@ -156,7 +160,7 @@ frontend/src/
 │   ├── weekday.ts               #   0 == Monday
 │   └── errors.ts
 │
-├── context/ToastContext.tsx     # cross-cutting UI state ONLY (see §7 Frontend)
+├── context/ToastContext.tsx     # cross-cutting UI state ONLY (see §6.5)
 ├── lib/queryClient.ts           # retry policy
 └── styles/index.css             # design tokens
 ```
@@ -318,7 +322,7 @@ cd frontend && npm run typecheck
 cd backend && uv run pytest -q
 ```
 
-**124 passed.** The backend tests need a real Postgres — they are integration
+**146 passed.** The backend tests need a real Postgres — they are integration
 tests by design, since advisory locks and partial unique indexes cannot be
 faked. `tests/conftest.py` forces `DATABASE_URL` to `DATABASE_URL_TEST`
 (default `postgresql+psycopg://localhost/richpanel_test`) *before* `app.db` is
@@ -328,7 +332,7 @@ imported, and truncates every table after each test.
 cd frontend && npx vitest run
 ```
 
-**140 passed across 7 test files** (jsdom + Testing Library).
+**171 passed across 7 test files** (jsdom + Testing Library).
 
 ### 3.6 Environment variables
 
@@ -381,12 +385,12 @@ Times cross the wire as **float hours**: `22.5` means 22:30.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | Liveness. |
-| `GET` | `/api/v1/agents` | List agents (`limit`/`offset`). |
+| `GET` | `/api/v1/agents` | List agents. `limit`/`offset`, plus `q` (ILIKE on name). |
 | `GET` | `/api/v1/agents/{id}/schedules` | Schedules this agent is on. |
 | `POST` | `/api/v1/schedules` | Create a schedule with its weekday hours. |
 | `GET` | `/api/v1/schedules` | List active schedules. |
 | `GET` | `/api/v1/schedules/{id}` | One schedule, hours recombined for display. |
-| `PUT` | `/api/v1/schedules/{id}` | Update **hours only** (see §8). |
+| `PUT` | `/api/v1/schedules/{id}` | Update hours (always) plus name/start_date/end_date (partial — only fields sent are changed; `start_date` only while still in the future). |
 | `GET` | `/api/v1/schedules/{id}/deletion-impact` | Read-only preview: who gets unassigned. |
 | `DELETE` | `/api/v1/schedules/{id}` | Soft-delete, cascading to assignments and hours. |
 | `GET` | `/api/v1/schedules/{id}/agents` | Assignees. |
@@ -430,7 +434,7 @@ schedule_weekday_hours_active_uniq (schedule_id, weekday, is_overnight_tail) WHE
 schedule_agents_active_uniq        (schedule_id, agent_id)                   WHERE deleted_at IS NULL
 ```
 
-The first enforces one window per weekday (§6.4). The second is what makes
+The first enforces one window per weekday (§6.1). The second is what makes
 re-assigning an agent after an unassignment possible at all — a plain
 `UNIQUE` would be blocked forever by the old soft-deleted row.
 
@@ -438,264 +442,59 @@ re-assigning an agent after an unassignment possible at all — a plain
 
 ## 6. Decision log
 
-The section to read to understand *why the code looks like this*. Each entry is
-**the decision**, **why**, and **what was rejected**. Sourced from the commit
-bodies and `docs/superpowers/specs/`; where a decision has no recorded
-rationale, that is stated rather than guessed.
+Terse, one entry per decision: what was decided and why. Sourced from commit
+bodies — read `git log` for the full reasoning behind any entry.
 
 ### 6.1 Domain
 
-**Timezone is IST, system-wide, non-configurable.**
-`app/domain/types.py::IST = ZoneInfo("Asia/Kolkata")` is the single place a zone
-is named anywhere in the codebase.
-*Why:* ticket windows are stored as `timestamptz` so they remain real
-**instants**; the service converts to IST at its own boundary
-(`report_service._to_ist`). Before this, `generate_report` returned the naive
-datetime it was handed while `get_report` returned whatever the DB session's
-`TimeZone` produced — the two disagreed, and report weekdays shifted with the
-host's ambient timezone. Pinning the conversion in app code makes the result
-independent of the database session.
-*Rejected:* per-schedule / configurable timezones (no requirement for a
-globally distributed agent base; the constant is the documented extension
-point). Also rejected: naive `timestamp` columns, which lose the instant.
-
-**Business hours use a closed-form O(1) calculation, never a per-day loop.**
-`domain/business_hours.py` computes: partial first day + partial last day +
-`full_weeks × weekly_total` + the ≤6 remainder days looked up by weekday.
-*Why:* NFR — an arbitrarily large report window must not cost more. **Measured
-on this machine:** a 1-day window and a 365-day window each issue **4 SQL
-statements** and take single-digit milliseconds; the query count is also flat as
-the number of distinct schedules grows (1 schedule → 4, 25 schedules → 4).
-*Rejected:* iterating calendar days in the window, which is O(window length).
-
-**Overnight shifts are split at storage.** A midnight-crossing shift
-(22:00→06:00) becomes two ordinary same-day rows: a **primary** ending at
-`interval '24:00:00'` on the starting weekday, and a **tail** starting at
-`interval '0'` on the next weekday with `is_overnight_tail = true`. Sunday
-wraps to Monday by modulo-7. They are recombined for display, so the API and UI
-never see the split.
-*Why:* it collapses both the overlap check and the hours math back to
-same-weekday-only comparisons — no adjacent-day or circular-boundary logic
-anywhere in the read path. `24:00:00` rather than `23:59:59` so the two rows are
-exactly adjacent with no gap.
-*Rejected:* a "week-offset + circular interval" representation requiring
-±604800s wraparound comparisons at the Sunday→Monday boundary.
-*Related, recorded in `9071922`:* the column type is `interval`, not `time` or
-an integer. Postgres `time` accepts `24:00:00` but Python's `datetime.time`
-cannot represent it, so it would not round-trip through the driver; a plain
-integer round-trips but loses readability in both SQL and Python.
-
-**Exactly one time window per weekday per schedule.**
-*Why:* split shifts and lunch breaks are out of scope for this build. Enforced
-in two places on purpose — the partial unique index
-`(schedule_id, weekday, is_overnight_tail)`, and an explicit check in
-`ShiftInputSchema`, because `find_self_overlaps()` does **not** catch it: two
-same-weekday windows that do not overlap pass domain validation and then
-violate the index, which surfaced as a 500.
-*Extension path (documented in the code):* drop that index and delete the
-`_reject_duplicate_weekdays` check together.
-*Note:* the decision is recorded as out-of-scope; the commits and spec do not
-document a deeper rationale for rejecting multiple windows beyond scope.
-
-**24-hour schedules are unsupported.** `end_hours == 0` and `end_hours == 24`
-are both rejected with 422 (verified against the running API).
-*Why:* `start == end` is a zero-duration shift, and `22:00 → 00:00` normalises
-to a primary row plus a **zero-length** overnight tail, which the domain
-dataclass rejects. Both previously failed deep in normalisation as a 500. The
-error message names the workaround (`23.99`).
-
-**A report cannot cover a future window** (422).
-*Why:* a report answers "how many business hours did each agent have while this
-ticket was open". A window reaching into the future would report *scheduled
-capacity* as *history* — a number that looks perfectly plausible and is wrong,
-which is the worst kind of wrong.
-
-**A schedule cannot be created starting in the past.**
-*Why:* a schedule declares when people **will** work; you cannot change what
-already happened. Past days are genuinely unselectable in the picker (disabled
-matcher, not keyboard-reachable), with a submit-time guard for a tab left open
-past midnight.
-*Honest caveat:* **this is enforced in the UI only.** The API accepts a past
-`start_date` and returns 201 — verified. The edit path is deliberately
-untouched, so a schedule that legitimately started earlier cannot be
-retroactively invalidated.
+- **IST, system-wide, non-configurable.** Windows are `timestamptz`; converted to IST at one boundary. Fixed two endpoints disagreeing on weekday.
+- **Business hours are O(1)**, not a per-day loop. 4 queries whether the window is 1 day or 365.
+- **Overnight shifts split at storage** — primary row to 24:00, tail row from 0 the next weekday. Reduces overlap math to same-weekday comparisons.
+- **One time window per weekday**, enforced by a unique index plus a Pydantic check (the domain check alone misses non-overlapping same-day windows).
+- **24-hour schedules unsupported** — `end_hours` of `0` or `24` both 422.
+- **A report can't cover a future window** (422) — would report scheduled hours as history.
+- **A schedule can't start in the past** — UI-only. The API itself still accepts it (unfixed, verified).
+- **A schedule's `start_date` can't be edited into the past either.** Was checking only the old value's elapsed-ness, not the new one. Fixed.
 
 ### 6.2 Data model
 
-**Soft deletes everywhere via `deleted_at`.**
-*Why:* two goals — undo of an accidental schedule delete, and an audit trail of
-assignment history ("was this agent on this schedule, and when").
-*Necessary consequence:* `UNIQUE(schedule_id, agent_id)` had to become a
-**partial** unique index `WHERE deleted_at IS NULL`, otherwise re-assigning an
-agent after an unassignment would be blocked forever by the old row. Every read
-path must filter `deleted_at IS NULL`.
-*Scope limit, stated in the spec:* this gives **existence** history, not
-**value** history — it records that a row stopped applying, not what it looked
-like before an edit.
-
-**`created_at` on every table; `updated_at` only where rows are mutated after
-insert.**
-*Why (the bug this fixed, commit `f9e4b92`):* `schedules.updated_at` had a
-`server_default` and nothing else — set once at insert and never touched, so it
-was permanently **exactly equal to `created_at`**. A column that silently lies
-is worse than one that is absent, because eventually something displays it as
-"last modified" and is believed. `onupdate=func.now()` on the model fixes the
-general case, and fires for the Core `update()` statements the queries module
-uses, so unassigning an agent now stamps `schedule_agents.updated_at` with no
-extra code.
-*Why `onupdate` alone was not enough (commit `dab4887`):* editing hours rewrites
-rows in the **child** table `schedule_weekday_hours` and never issues an UPDATE
-against the `schedules` row — so `onupdate` never fires and "last modified"
-would sit at creation time no matter how often the hours changed. Hence an
-explicit `touch_schedule()` called from `update_schedule_hours`.
-*Deliberately omitted:* `updated_at` on `agents`, `resolution_reports` and
-`resolution_report_agent_hours` — those rows are written once and never
-mutated, so the column would be permanently equal to `created_at`, which is
-precisely the failure mode being fixed.
-
-**Overlap prevention uses a Postgres advisory lock, not a DB constraint.**
-`pg_advisory_xact_lock(agent_id)` is taken **inside the same transaction** as
-the check and the write.
-*Why keyed on `agent_id`:* the invariant is per-agent, so this serialises
-exactly the operations that can conflict and nothing else. The
-**transaction-scoped** variant is used specifically because it auto-releases on
-COMMIT/ROLLBACK — no leaked lock if a process dies mid-flight — and it is the
-flavour compatible with PgBouncer transaction pooling if that is ever added.
-*Rejected — `EXCLUDE USING gist`:* it can only compare rows within a single
-table, and the data is normalised across `schedules` / `schedule_weekday_hours`
-/ `schedule_agents`. Making it work would need a trigger-synced denormalised
-shadow table; that complexity was judged disproportionate.
-*Rejected — `SELECT … FOR UPDATE`:* it only locks rows that already exist, so an
-agent's first-ever assignment has nothing to lock and stays racy.
-*Accepted trade-off, stated in the spec:* the invariant is only as strong as
-this one disciplined write path — report computation trusts it and does not
-re-check. See §8 for a case where that trust is currently misplaced.
+- **Soft deletes everywhere via `deleted_at`** — existence history, not value history. Forces the unique index to be partial (`WHERE deleted_at IS NULL`).
+- **`created_at` on every table; `updated_at` only where rows mutate post-insert.** Hours edits touch a child table, so `touch_schedule()` bumps the parent explicitly.
+- **Every audit timestamp uses the DB clock (`func.now()`)**, not the app clock. Mixing the two let `updated_at` move backwards under real clock skew — proven by a failing test.
+- **Overlap prevention is a Postgres advisory lock**, not a DB constraint — transaction-scoped, auto-releases on commit/rollback.
+- **The edit-vs-assign race is fixed** with a schedule-scoped advisory lock taken before agent locks in both paths. A real-thread concurrency test proves it.
 
 ### 6.3 API
 
-**One error envelope: `{error_code, message, details}`.** FastAPI's native 422
-body is `{"detail": [...]}` — a different shape from every other error. It is
-normalised in `main.py` so the UI parses **one** shape, and the leading
-`body`/`query` segment is dropped from the location tuple so `field` reads as
-`shifts.0.start_hours` — directly addressable in a form.
-
-**Validation is 422 with field-level detail; conflicts are 409; 500 leaks
-nothing.**
-*The fix this encodes (commit `a52fc51`):* five inputs a user could simply type
-into the form returned **500** — `start_hours == end_hours`, `end_hours == 0`,
-`end_date < start_date`, two windows on one weekday, and out-of-range values.
-`ShiftInputSchema` validated each field's *range* but not the *relationships
-between* fields, so those fell through to a bare `ValueError` in a domain
-dataclass or to a database constraint. Relational rules now live in the Pydantic
-schema, at the source, rather than being patched per endpoint.
-
-**A read-only pre-flight conflict check: `POST /schedules/{id}/agents/check`.**
-*Why:* the assign dialog asks the backend which agents *cannot* be assigned as
-it opens, and renders those rows disabled with the reason ("Already on Day
-Shift — Mon 09:00–17:00") — rather than letting the user tick an agent and
-discover on submit that it was never possible. It returns **structured** conflict
-detail: which schedule, and the exact colliding hours.
-*Why POST for a read:* the agent-id list can be long enough to strain a query
-string, and a batch of ids is a request body, not a resource path. It remains
-side-effect free.
-*Why the overlap rule is NOT duplicated client-side:* a second copy of that rule
-in TypeScript would be free to drift from the domain layer. The backend gets the
-last word.
-*Explicitly advisory:* state can change between the check and the write, so
-`assign_agent` still performs the real check under its lock. The 409-at-assign
-path is untouched.
+- **One error envelope**: `{error_code, message, details}` — normalizes FastAPI's native shape so `field` is directly addressable.
+- **422 for validation, 409 for conflicts, 500 leaks nothing.** Relational rules live in Pydantic now, not a bare `ValueError` that used to 500.
+- **`POST /schedules/{id}/agents/check`** — read-only pre-flight so the UI can disable conflicting agents up front. Advisory only; the write re-checks under its own lock.
+- **That check was N+1; now batched.** 2005 agents: 687ms → 100ms.
+- **`GET /agents` gained `q` search** — without it, an agent past page one was unreachable.
+- **A whole-request 422 (`field: "body"`) now has one handler**, `ApiError.bodyError`. Previously only one form handled it; the rest silently swallowed it.
 
 ### 6.4 Infrastructure
 
-**Three containers on three separate ports, with CORS — not a same-origin
-reverse proxy.** Every browser call is therefore cross-origin and must be
-allowed explicitly via `CORS_ALLOWED_ORIGINS`. Postgres is published on
-**55432** rather than 5432 so it cannot collide with a local Postgres.
-*Trade-off accepted:* a proxy would remove CORS entirely, but the separate-port
-layout keeps each service independently runnable and its logs unmixed.
-
-**Env files per service, never committed.** `backend/.env` is loaded into *both*
-the postgres and backend containers, because the credentials and the connection
-string are two views of the same thing and must not drift. `.env.example` is the
-committed, documented template.
-
-**Agents are seeded on container start when the table is empty.**
-*Why:* agent creation is out of scope by requirement, so a fresh database would
-otherwise have no agents at all and the report screen would render an empty
-table — `docker compose up` would not yield a usable system.
-*How it is made safe:* the script takes a **two-argument** advisory lock
-(`pg_advisory_xact_lock(ns, key)`), counts the table, and returns without
-writing if any agent exists. Postgres keeps single-key and key-pair advisory
-locks in separate spaces, so this cannot collide with the `agent_id` lock the
-assignment path takes. Two replicas booting simultaneously cannot double-seed.
-*Deliberately non-fatal:* a failed seed is logged loudly and startup continues —
-it is a convenience problem, not a reason to refuse traffic.
-
-**Migrations run on every boot**, before uvicorn starts, with a bounded retry
-loop. Compose already gates startup on Postgres reporting healthy; the retry
-covers the narrow window where the probe passes but the server is still
-finishing its post-init restart. (See §8 for the multi-replica caveat.)
+- **Three containers, three ports, CORS** — not a same-origin proxy. Postgres on 55432 to avoid clashing with a local install.
+- **Env files per service, never committed.**
+- **Agents seed on first boot only**, guarded by an advisory lock so two replicas can't double-seed.
+- **Migrations run on every boot** — unsafe with more than one replica (§8).
 
 ### 6.5 Frontend
 
-**Stack:** React 19 + Vite + TypeScript + Tailwind v4, TanStack Query v5 for
-server state, Radix primitives (Dialog, Popover) + react-day-picker for the
-calendar, plus a hand-built ARIA listbox for time — no library ships one.
-
-**Layering `pages → hooks → apiService → http` mirrors the backend**, with
-`components/` and `helpers/` as leaves that never import upward. Components
-never touch `apiService`.
-
-**TanStack Query owns server state, so React Context holds only cross-cutting
-UI state** (toasts). A `SchedulesContext` / `AgentsContext` / `ReportContext` is
-explicitly forbidden by design rule R6 in the frontend spec.
-*Why:* the TanStack cache is already global. A context wrapping fetched data
-would duplicate it and produce two sources of truth that can disagree.
-Everything else — schedules, agents, the selected schedule id, the report
-window — lives in the query cache or in the URL.
-
-**Mutations never retry.** Queries retry only transient failures (network,
-timeout, 5xx) and at most twice.
-*Why:* a timed-out POST **may well have succeeded**. Retrying risks a duplicate
-schedule or a duplicate assignment. Retrying a 404 or 422 is also pointless — it
-turns one failure into four identical ones and a four-times-longer wait.
-
-**Cache invalidation is worked out case-wise, not by widening to a prefix.**
-Deleting a schedule is the one mutation whose server-side effect fans out beyond
-the entity named in the request — `soft_delete_schedule` cascades to N
-unassignments — and the 204 carries no body, so the client is never told whose
-assignments went with it.
-*Why from the cache, not from the deletion-impact snapshot:* that list is
-fetched when the confirm dialog **opens**, and someone may assign another agent
-before the user confirms; invalidating from it would miss them. Any cached
-agent-schedule list that mentions this schedule is stale by definition. The
-tests assert both directions, so the invalidation cannot silently drift back to
-a broad prefix.
-
-**Two separate date fields, not a range picker.**
-*The bug:* clicking a date reset it as the START and nulled the end — that is
-react-day-picker's range semantics, where a click after a complete range begins
-a new one. Badly wrong here, because **a null end means ONGOING**, so a stray
-click silently turned "1 Jan to 31 Mar" into "runs forever".
-*Fixed structurally* rather than by taming the click rule: `start_date` and
-`end_date` are distinct API fields, not two halves of one gesture. Each owns its
-state so neither can clear the other, "ongoing" is reachable only via the end
-field's own Clear, and the two 422 field errors land on the control that caused
-them instead of sharing one slot.
-
-**`ApiError` normalises every failure into one typed shape** with a `kind` the
-UI switches on — including `network` and `timeout`, which are genuinely
-reachable because the API is on a different origin. A CORS rejection is
-indistinguishable from being offline; the browser withholds the reason.
-
-**Visual design is derived from richpanel.com's own computed styles** rather
-than invented, so the internal tool reads as part of the product: General Sans
-(UI), Nohemi (display), ink `#101828`, brand blue `#004E96`, off-whites
-`#FAFBFE` / `#FBF7F2`, radii 8/12px. Fonts are **self-hosted** to keep CSP at
-`font-src 'self'` and remove a render-blocking third-party request — but the
-**binaries are not committed** (see `frontend/public/fonts/README.md`). Until
-they are added the UI falls back to the system sans stack: fully usable, just
-not on-brand.
+- **Stack**: React 19, Vite, TS, Tailwind v4, TanStack Query, Radix + react-day-picker, a hand-built time listbox.
+- **Layering mirrors the backend**: `pages → hooks → apiService → http`.
+- **TanStack Query owns server state; Context holds only cross-cutting UI state** (toasts) — a per-entity Context would be a second source of truth.
+- **Mutations never retry** — a timed-out POST may have already succeeded.
+- **Cache invalidation is worked out case-wise**, not by widening to a prefix.
+- **Two date fields, not a range picker** — a range calendar's restart-on-click silently turned "ongoing" into a real end date.
+- **`DateRangePicker` deleted** — fully built but unrendered, a landmine for reintroducing that same bug.
+- **`ApiError` normalizes every failure into one typed shape**, including network/timeout (CORS looks identical to offline).
+- **Schedule name/dates are now editable in the UI.** Start date locks once elapsed rather than failing silently on submit.
+- **The assign picker now searches and paginates** — it used to hard-cap at 50 with no error.
+- **An overnight tail is checked against that weekday's own hours client-side** — used to be an opaque 409 on Save.
+- **Modal focus now returns to its trigger, not `<body>`.** Root cause: Radix assumes `Dialog.Trigger` owns the trigger, which this app never uses.
+- **Visual design is derived from richpanel.com's own computed styles.**
 
 ---
 
@@ -705,12 +504,14 @@ Everything below was measured on this checkout, not estimated.
 
 | Check | Result |
 |---|---|
-| `uv run pytest -q` (backend) | **124 passed** |
-| `npx vitest run` (frontend) | **140 passed**, 7 files |
+| `uv run pytest -q` (backend) | **146 passed** |
+| `npx vitest run` (frontend) | **171 passed**, 7 files |
+| `npx tsc -b --noEmit --force` | clean, no errors |
+| `npm run build` | clean |
 | `alembic current` | `0002 (head)` |
-| `npm run build` / `npm run typecheck` | both clean |
 | Report: 1-day vs 365-day window | **4 queries each**, ~equal time |
 | Report: 1 vs 25 distinct schedules | **4 queries each** |
+| Assign-agent conflict check, 2005 agents | **7 scans, 100ms** (was 2005+2004 scans, 687ms) |
 
 ---
 
@@ -730,65 +531,48 @@ is billed for the entire two months. **Unresolved.**
 `find_overlaps` compares weekday + time range. Two schedules with identical
 hours in completely non-overlapping date ranges (say Jan vs Dec) are therefore
 rejected as conflicting, even though no agent could ever work both at once.
+`update_schedule`'s own docstring flags this: a date-only edit re-validates
+nothing, because no date change can currently create or resolve an overlap.
 **Unresolved.**
 
 **Reports exclude soft-deleted schedules entirely.** The report query filters
 `Schedule.deleted_at IS NULL` with no reference to the report window, so
 regenerating a report over a **past** window omits schedules that were genuinely
-active then. The fix is a predicate change (compare `deleted_at` against the
-window), not a schema change. **Not done.**
+active then. **Not done.**
 
 **Editing hours destroys the previous hours permanently.**
 `replace_weekday_hours_rows` **hard-deletes** the existing rows and inserts the
-new set. There is no value history, so a report regenerated after an edit uses
+new set. There is no value history — a report regenerated after an edit uses
 the new hours as though they had always applied. Existing saved reports are
-unaffected — they persist computed `business_seconds`, not a live reference.
-(The spec describes this table's edits as an in-place update; the implementation
-is delete-and-reinsert. Same practical consequence: no value history.)
-
-**A proven race lets one agent land on two overlapping schedules.**
-The advisory lock is keyed on `agent_id`, and **neither `assign_agent` nor
-`update_schedule_hours` locks the SCHEDULE**. `update_schedule_hours` locks only
-the schedule's *current* assignees — so an agent being added concurrently is not
-covered.
-
-Reproduced here with a 2-thread test:
-
-- Agent is on `S1` (Mon 09:00–17:00). `S2` is Mon 20:00–23:00 (no conflict).
-- Thread A: `update_schedule_hours(S2 → Mon 10:00–16:00)` — S2 has no assignees, so it locks nothing.
-- Thread B: `assign_agent(agent → S2)` — locks the agent, reads S2's *pre-edit* hours, sees no conflict.
-- **Both commit.** The agent is now on two overlapping schedules.
-
-Two concurrent `assign_agent` calls for the same agent *are* correctly
-serialised — that case works. **Not fixed.**
+unaffected (they persist computed `business_seconds`, not a live reference).
 
 ### Testing
 
-**Plan Task 21 was never executed** — the end-to-end smoke test
-(`tests/test_full_suite_smoke.py`) and the advisory-lock concurrency test
-(`tests/services/test_assignment_service_concurrency.py`) do not exist. Both
-checkboxes are still unticked in the plan. The race above is exactly what that
-task would have caught.
+**The end-to-end smoke test was never written** — `tests/test_full_suite_smoke.py`
+does not exist. The advisory-lock concurrency test **does now exist**
+(`tests/services/test_assignment_service_concurrency.py`, real threads on real
+connections) and passes — it reproduces and confirms the fix for the
+edit-vs-assign race documented in §6.2.
 
 ### Performance
 
-Known N+1s, **measured on this checkout**:
+Known N+1s, **measured on this checkout**, none of them touched by the
+assign-agent batching fix in §6.3:
 
 | Path | Scenario | Queries | Shape |
 |---|---|---|---|
 | `list_schedules` | 200 schedules | **201** | 1 list + 1 hours-fetch per schedule |
 | `list_assignees` | 51 assignees | **52** | 1 id list + 1 `get_agent` per id |
-| `update_schedule_hours` | 50 assignees, no other schedules | **106** | 1 + 2 per assignee |
-| `update_schedule_hours` | 50 assignees, each on 1 other schedule | **156** | plus 1 per other schedule |
+| `update_schedule` | 50 assignees, no other schedules | **106** | 1 + 2 per assignee |
+| `update_schedule` | 50 assignees, each on 1 other schedule | **156** | plus 1 per other schedule |
 
 All of them collapse onto the batching pattern that already exists in
-`reports/queries.py::get_weekday_hours_for_schedules` (one `WHERE id IN (...)`
-returning a dict). **Not applied.** Note the report path itself is already
-batched and is flat at 4 queries.
+`reports/queries.py::get_weekday_hours_for_schedules` and, since §6.3, in
+`schedule_agents/queries.py::get_other_active_schedule_ids_for_agents` — both
+already used by the assign-agent conflict check. **Not applied here.**
 
 ### API surface
 
-- **`PUT /schedules/{id}` updates hours only.** Name, `start_date` and `end_date` are not editable through the API at all. The UI's edit screen therefore renders only the hours editor.
 - **The 409 body carries a message string, not structured conflict detail** — `{"error_code":"conflict","message":"agent 1 would have 1 overlapping shift(s)"}`. The `check` endpoint *does* return structured detail, so the UI gets its rich conflict copy from the pre-flight call, not from the rejection.
 - **There is no authentication anywhere.** No login, no API keys, no authorization checks. Anyone who can reach the port has full read/write access.
 
@@ -797,5 +581,5 @@ batched and is flat at 4 queries.
 - **Secrets are plaintext in `.env`**, and the committed example ships `change_me_local_only`.
 - **No TLS** on any service.
 - **Migrations run on every container boot**, which races if you run more than one backend replica — two containers can attempt `alembic upgrade head` simultaneously. Fine for one replica; not safe to scale as-is. (The *seed* step is separately guarded by an advisory lock and is safe.)
-- **The frontend image's API base URL does not actually take effect.** `docker-compose.yml` passes build arg `VITE_APP_BASE_URL`, but `frontend/Dockerfile` declares `ARG VITE_API_BASE_URL` (`API` vs `APP`). Docker ignores an undeclared build arg, so the app falls back to the hardcoded `http://localhost:8000` in `src/api/http.ts`. This is masked locally because that fallback is the correct value for local development — but a containerised frontend cannot currently be pointed at any other API host.
-- **Vite inlines `VITE_APP_BASE_URL` at build time.** Even once the name mismatch is fixed, a production image built for one environment cannot be re-pointed by changing an environment variable — it must be rebuilt, or served through a runtime-config approach.
+- **The frontend image's API base URL does not actually take effect.** `docker-compose.yml` passes build arg `VITE_APP_BASE_URL`, but `frontend/Dockerfile` declares `ARG VITE_API_BASE_URL` (`API` vs `APP`). Docker ignores an undeclared build arg, so the app falls back to the hardcoded `http://localhost:8000` in `src/api/http.ts`. Masked locally because that fallback happens to be correct for local dev — but a containerised frontend cannot currently be pointed at any other API host.
+- **Vite inlines `VITE_APP_BASE_URL` at build time.** Even once the name mismatch above is fixed, an image built for one environment can't be re-pointed by changing an environment variable — it must be rebuilt, or served through a runtime-config approach.
