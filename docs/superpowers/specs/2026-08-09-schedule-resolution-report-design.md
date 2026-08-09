@@ -1,7 +1,12 @@
 # Schedule Configuration & Resolution Time Report — Design
 
 Date: 2026-08-09
-Status: Draft, pending user review
+Status: **Implemented.** Backend and frontend are both built and passing
+(124 backend tests, 140 frontend tests). Open items from the original draft have
+been resolved and are marked **RESOLVED** inline below, with the rationale that
+settled them. Where the implementation diverged from this design, the section
+says so — the code is the authority, this document records the reasoning.
+Outstanding gaps are tracked in the README's "Known limitations" section.
 
 ## 1. Overview
 
@@ -12,7 +17,9 @@ Richpanel is a customer support platform for ecommerce brands. This project adds
 
 This is a standalone greenfield build (not integrated into Richpanel's real codebase). Agents are seeded directly into the database; agent creation is out of scope.
 
-**Stack:** Python (FastAPI, SQLAlchemy ORM) backend, Next.js + Tailwind CSS frontend, Postgres database.
+**Stack:** Python (FastAPI, SQLAlchemy ORM) backend, React + Tailwind CSS frontend, Postgres database.
+
+> **CORRECTION (as built).** The frontend is **React 19 + Vite + TypeScript + Tailwind v4**, not Next.js. This design named Next.js, but the app is a purely client-side internal admin tool with no SSR, no routing-driven data loading and no server components — so Next.js's entire value proposition was unused while still imposing its build and runtime model. Vite gives the same SPA with a fraction of the surface. Server state is **TanStack Query v5**; pickers are **Radix primitives + react-day-picker** (the frontend implementation plan had specified `react-aria-components`; that was reversed during implementation because Radix was already in use for Dialog/Popover, with a hand-built ARIA listbox for time since no library ships one).
 
 ## 2. Functional Requirements
 
@@ -32,7 +39,17 @@ This is a standalone greenfield build (not integrated into Richpanel's real code
 
 ### 4.1 Timezone: single global timezone
 
-The whole system operates on one timezone. Every schedule's hours and every ticket start/end time are interpreted in that same timezone. Simpler than per-schedule timezones; acceptable given no requirement for a globally distributed agent base was stated. *Open item: which specific timezone (e.g. UTC, or the brand's local timezone) is a config constant to be pinned down before implementation — not yet specified.*
+The whole system operates on one timezone. Every schedule's hours and every ticket start/end time are interpreted in that same timezone. Simpler than per-schedule timezones; acceptable given no requirement for a globally distributed agent base was stated.
+
+> **RESOLVED — the timezone is IST (`Asia/Kolkata`), system-wide and non-configurable.**
+>
+> Pinned as a hard constant at `app/domain/types.py::IST`. It is the only place a timezone is named anywhere in the codebase, and therefore the single extension point if per-schedule timezones are ever required.
+>
+> **Rationale.** Ticket windows remain `timestamptz` columns, so they stay real *instants*; `IST` is what maps those instants onto weekday + offset-from-midnight wall-clock math. The conversion happens at the **service boundary** (`report_service._to_ist`), not in the database. This was not a cosmetic choice — it fixed a live defect: `generate_report` returned the naive datetime it was handed while `get_report` returned whatever the DB session's `TimeZone` setting produced, so the two disagreed and report weekdays shifted with the host's ambient timezone. Converting in application code makes the result independent of the session. Soft-delete timestamps moved to `datetime.now(IST)` for the same reason.
+>
+> **Rejected:** configurable/per-schedule timezones (no stated requirement; deferred, see §10), and naive `timestamp` columns (they discard the instant, so the same wall-clock value means different moments in different zones).
+>
+> Note the container-level `TZ` env var is *not* this setting. `TZ` only aligns container clocks and log timestamps; changing it does not move the business logic.
 
 ### 4.2 Schedule dating: recurring pattern + effective date range, owned by the schedule
 
@@ -52,7 +69,17 @@ Editing a schedule's hours applies immediately to every agent currently assigned
 
 Row-level locking (`SELECT ... FOR UPDATE` on existing `schedule_agents` rows) was considered and rejected: it only protects *existing* rows, so an agent's first-ever assignment (no row yet to lock) wouldn't be protected against a concurrent race.
 
-**Mechanics:** `BEGIN` → `pg_advisory_xact_lock(agent_id)` (or, for a schedule edit, every currently-assigned agent's id, in sorted order to avoid deadlocks) → read the agent's other active schedules live → compute overlap → conflict found: `ROLLBACK`, return a structured 409 with no write having happened; clean: perform the `INSERT`/`UPDATE`, `COMMIT`. Because the check and the write are the same transaction, there's no separate "preview check" call needed and no redundant re-validation — a failed attempt is safe to retry since nothing was written.
+**Mechanics:** `BEGIN` → `pg_advisory_xact_lock(agent_id)` (or, for a schedule edit, every currently-assigned agent's id, in sorted order to avoid deadlocks) → read the agent's other active schedules live → compute overlap → conflict found: `ROLLBACK`, return a structured 409 with no write having happened; clean: perform the `INSERT`/`UPDATE`, `COMMIT`. Because the check and the write are the same transaction, there is no redundant re-validation on the write path — a failed attempt is safe to retry since nothing was written.
+
+> **AMENDED — a separate read-only pre-flight check WAS added: `POST /api/v1/schedules/{id}/agents/check`.**
+>
+> This paragraph originally concluded that no "preview check" call was needed. That holds for *correctness* but not for *usability*, which is why the endpoint exists. Without it the assign dialog can only offer every agent and then reject the user's choice on submit — the user discovers a conflict after committing to it. The check lets the dialog render conflicting agents as disabled **with the reason** ("Already on Day Shift — Mon 09:00–17:00"), naming the colliding schedule and hours.
+>
+> It changes nothing about the locking argument above: the check **writes nothing and takes no lock**, and is explicitly **advisory** — state can change between the check and the write, so `assign_agent` still performs the authoritative check under its own advisory lock and the 409-at-assign path is untouched. The two use the same per-schedule comparison function so they cannot disagree about what counts as a conflict.
+>
+> `POST` rather than `GET` for a read-only operation: the agent-id list can be long enough to strain a query string, and a batch of ids is a request body, not a resource path.
+>
+> The overlap rule is deliberately **not** reimplemented client-side — a second copy in TypeScript would be free to drift from the domain layer.
 
 **Accepted trade-off:** the non-overlap invariant is only as strong as this single, disciplined write path (report computation trusts it and does not defensively re-check — see 4.9). This was chosen deliberately: schedule/assignment writes are rare (admin-driven), while report reads are frequent and must stay O(1) per schedule — so complexity was pushed onto the rare write path rather than the frequent, scale-critical read path.
 
@@ -72,7 +99,11 @@ This was chosen over an alternative "week-offset + circular interval overlap" re
 
 Chosen for two goals: undo/restore of an accidental schedule delete, and an audit trail of assignment history (when was an agent on a given schedule).
 
-Note on scope: soft-delete gives **existence/period history** ("was this record active, and when"), not **value history** ("what did it look like before an edit"). For `schedule_weekday_hours` specifically, edits remain a plain in-place `UPDATE` (deleted_at is only ever set when the parent schedule is soft-deleted, cascaded) — true value-history would require switching edits to a soft-delete-and-reinsert pattern, which was explicitly deferred as unnecessary complexity for now (see Section 8).
+Note on scope: soft-delete gives **existence/period history** ("was this record active, and when"), not **value history** ("what did it look like before an edit"). For `schedule_weekday_hours` specifically, edits are a plain in-place replacement (deleted_at is only ever set when the parent schedule is soft-deleted, cascaded) — true value-history would require switching edits to a soft-delete-and-reinsert pattern, which was explicitly deferred as unnecessary complexity for now (see Section 8).
+
+> **CLARIFICATION (as built).** This section says edits "remain a plain in-place `UPDATE`". The implementation (`schedules/queries.py::replace_weekday_hours_rows`) is a **hard `DELETE` of the schedule's existing rows followed by an `INSERT` of the new set**, in one flush, rather than a row-wise `UPDATE`. The practical consequence is what this section describes and is unchanged — **no value history** — but it is worth stating plainly: the previous hours are destroyed permanently, so a report regenerated after an edit uses the new hours as though they had always applied. Already-saved reports are unaffected, because they persist the computed `business_seconds` number rather than a live reference (see 4.7).
+>
+> A second consequence, resolved separately: because this rewrites a **child** table and never issues an `UPDATE` against the `schedules` row, SQLAlchemy's `onupdate` on `schedules.updated_at` can never fire. `touch_schedule()` is called explicitly from `update_schedule_hours` to bump it — otherwise "last modified" would sit at creation time no matter how often the hours changed.
 
 **Necessary consequence:** `UNIQUE(schedule_id, agent_id)` on `schedule_agents` becomes a **partial** unique index, `WHERE deleted_at IS NULL` — otherwise re-assigning an agent after a prior unassignment would be blocked by the old soft-deleted row. Every read path touching `schedules` or `schedule_agents` must filter `WHERE deleted_at IS NULL`.
 
@@ -89,6 +120,19 @@ Editing a schedule's weekday hours re-validates against every currently-assigned
 ### 4.9 Report computation trusts the non-overlap invariant
 
 Given the invariant is enforced by the write path (4.4/4.8), the report computation sums each `(agent, schedule)` pair's contribution directly rather than defensively merging/deduping overlapping intervals. This keeps the read path — the one place explicitly required to be fast at scale — as simple as a plain sum, at the cost of assuming the write-path discipline never has a bug or bypass.
+
+> **CAVEAT — that assumption is currently violated. The trust is misplaced under concurrency.**
+>
+> This section's "at the cost of assuming the write-path discipline never has a bug" is not hypothetical. A reproducible race exists, demonstrated with a 2-thread test:
+>
+> - An agent is on `S1` (Mon 09:00–17:00). `S2` is Mon 20:00–23:00 — no conflict.
+> - Thread A calls `update_schedule_hours(S2 → Mon 10:00–16:00)`. Per 4.4's mechanics it locks every **current assignee** of `S2` — and `S2` has none, so it locks nothing.
+> - Thread B calls `assign_agent(agent → S2)`. It locks the agent, reads `S2`'s **pre-edit** hours, and correctly sees no conflict.
+> - Both commit. The agent is now on two overlapping schedules, and the report will double-count.
+>
+> The root cause: the advisory lock is keyed on `agent_id`, and **neither write path locks the SCHEDULE**. An agent being *added* concurrently is outside the set `update_schedule_hours` locks. Two concurrent `assign_agent` calls for the same agent *are* correctly serialised — that case works as designed.
+>
+> Until this is fixed the report can silently double-count. Not fixed; tracked in the README. Task 21 of the implementation plan (the advisory-lock concurrency test) was never executed, which is precisely why this survived to be found later.
 
 ## 5. Data Model
 
@@ -195,7 +239,9 @@ All three matched exactly, including the boundary-clipped shift blocks and the S
 
 ## 7. High-Level Architecture
 
-Three tiers: **Next.js frontend** (client-side rendered, no SSR needed for an internal admin tool) → **FastAPI backend** (all business logic, validation, locking) → **Postgres**.
+Three tiers: **React SPA frontend** (client-side rendered, no SSR needed for an internal admin tool) → **FastAPI backend** (all business logic, validation, locking) → **Postgres**.
+
+> **CORRECTION (as built).** Built with **Vite**, not Next.js — see the correction in §1. The reasoning in this very sentence is what settled it: "client-side rendered, no SSR needed" describes an SPA, and Vite delivers exactly that without Next.js's server runtime. Frontend layering mirrors the backend's: `pages → hooks → api/apiService → api/http`, with `components/` and `helpers/` as leaves that never import upward.
 
 **Backend layering:**
 - `api/` — HTTP only: parse request, call a service, map results/exceptions to status codes.
@@ -222,8 +268,12 @@ Three tiers: **Next.js frontend** (client-side rendered, no SSR needed for an in
 **Endpoints:**
 - `GET /api/v1/agents`, `GET /api/v1/agents/{id}/schedules`
 - `GET|POST /api/v1/schedules`, `GET|PUT /api/v1/schedules/{id}`, `GET /api/v1/schedules/{id}/deletion-impact`, `DELETE /api/v1/schedules/{id}`
-- `GET|POST /api/v1/schedules/{id}/agents`, `DELETE /api/v1/schedules/{id}/agents/{agent_id}`
+- `GET|POST /api/v1/schedules/{id}/agents`, `POST /api/v1/schedules/{id}/agents/check`, `DELETE /api/v1/schedules/{id}/agents/{agent_id}`
 - `POST /api/v1/reports`, `GET /api/v1/reports`, `GET /api/v1/reports/{id}`
+
+`POST /schedules/{id}/agents/check` was added after this design was first written — the read-only pre-flight conflict check described in the amendment to 4.4. It is the only endpoint that returns **structured** conflict detail (which schedule, which colliding hours); the 409 raised by an actual assign carries a message string only.
+
+**As-built note:** `PUT /api/v1/schedules/{id}` updates **weekday hours only**. Name, `start_date` and `end_date` are not editable through the API. This was not an explicit decision recorded anywhere — it is simply the scope the update path was built to — but it is load-bearing for the frontend, whose edit screen therefore renders only the hours editor, and it is why a schedule that legitimately started in the past cannot be retroactively invalidated.
 
 List endpoints take `limit`/`offset` (shared `PaginationParams` in `shared/pagination.py`).
 
@@ -253,10 +303,30 @@ tests/
 - `services/` / `components/` — integration tests against a real Postgres instance, including concurrency tests for the advisory-lock overlap checks.
 - `api/` — end-to-end tests via FastAPI's TestClient.
 
+> **STATUS (as built): 124 backend tests and 140 frontend tests pass — but the concurrency tests named above were never written.**
+>
+> Task 21 of the implementation plan (`backend/tests/test_full_suite_smoke.py` and `backend/tests/services/test_assignment_service_concurrency.py`) was never executed; both files are absent and the plan's checkboxes are unticked. Every existing backend test runs through a single-session fixture, so no test in the suite exercises two genuinely concurrent transactions.
+>
+> This is not a cosmetic gap. The race documented in the caveat to 4.9 is exactly the property that task was written to cover, and it went undetected until probed manually. **The advisory-lock behaviour this design leans on is, as of now, unverified by the test suite in the one dimension that matters: concurrency.**
+>
+> One thing the suite does do well, worth preserving: `tests/conftest.py` forces `DATABASE_URL` to the test database *before* `app.db` is imported and then reuses `app.db`'s own engine, rather than constructing a second one. That makes it structurally impossible for the fixture's cleanup and the code under test to target different databases — a defect that existed earlier and was fixed in `de3df59`.
+
 ## 10. Deferred / Future Extensions
 
 Explicitly out of scope for this build, noted so they aren't accidentally assumed:
 - Multiple shifts per day (e.g. lunch-break splits) and holiday/date-specific exceptions to a schedule.
-- Per-schedule timezones (currently one global timezone system-wide).
+- Per-schedule timezones (currently one global timezone system-wide — **now pinned to IST**, see 4.1).
 - Value-history (not just existence-history) for `schedule_weekday_hours` edits.
 - Agent creation/editing (agents are seeded only).
+
+**Added during implementation, confirmed as deliberate:**
+- **Round-the-clock (24-hour) schedules are unsupported.** `end_hours == 0` and `end_hours == 24` are both rejected with a 422 naming the field. `start == end` is a zero-duration shift, and `22:00 → 00:00` normalises to a primary row plus a *zero-length* overnight tail, which the domain dataclass rejects. Both previously escaped as 500s. The error message names the workaround (`23.99`).
+- **Exactly one time window per weekday per schedule.** Enforced twice on purpose: the partial unique index `(schedule_id, weekday, is_overnight_tail)`, and an explicit check in `ShiftInputSchema`. The second is required because `find_self_overlaps()` does **not** catch it — two same-weekday windows that do not overlap pass domain validation and then violate the index, which surfaced as a 500. **The documented extension path is to drop that index and delete the `_reject_duplicate_weekdays` check together.** The rationale on record is scope only; no deeper argument against multiple windows is documented in the commits or this spec.
+- **Reports cannot cover a future window** (422). A window reaching into the future would report *scheduled capacity* as *history* — a plausible-looking, wrong number.
+- **Schedules cannot be created starting in the past** — a schedule declares when people *will* work. Enforced **in the UI only**; the API still accepts a past `start_date` and returns 201.
+
+**Known gaps discovered after implementation** (detail and reproduction steps in the README's "Known limitations"):
+- A schedule's `start_date`/`end_date` filter *which* schedules apply to a report but do not **clip** the hours, so a schedule effective for one day inside a two-month window is billed for the whole window.
+- Overlap is judged on time-of-day only, ignoring effective dates — two schedules with identical hours in non-overlapping date ranges are wrongly rejected as conflicting.
+- Report queries exclude soft-deleted schedules unconditionally, so regenerating a report over a *past* window omits schedules that were active then. Fix is a predicate, not a schema change.
+- The concurrency race described in the caveat to 4.9.
