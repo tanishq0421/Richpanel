@@ -469,7 +469,10 @@ export function AssignAgentModal({ open, onOpenChange, scheduleId }: AssignAgent
                     data-selected={isSelected || undefined}
                     data-conflict={conflict !== undefined || undefined}
                     className={cn(
-                      'flex items-center gap-3 border-b border-[var(--color-hairline)] px-3 py-2.5 last:border-b-0',
+                      // items-start, not items-center: a conflict reason wraps
+                      // to several lines, and centring would float the checkbox
+                      // against the middle of the block.
+                      'flex items-start gap-3 border-b border-[var(--color-hairline)] px-3 py-2.5 last:border-b-0',
                       // The tint is a hint, not the message: the row is also
                       // marked by a rule down its left edge, an icon, and the
                       // reason in words, so nothing here depends on seeing red.
@@ -487,7 +490,7 @@ export function AssignAgentModal({ open, onOpenChange, scheduleId }: AssignAgent
                     <input
                       id={inputId}
                       type="checkbox"
-                      className="size-4 shrink-0 accent-[var(--color-brand)] disabled:cursor-not-allowed"
+                      className="mt-0.5 size-4 shrink-0 accent-[var(--color-brand)] disabled:cursor-not-allowed"
                       checked={isSelected}
                       disabled={isAssigning || conflict !== undefined}
                       aria-disabled={conflict !== undefined || undefined}
@@ -496,59 +499,70 @@ export function AssignAgentModal({ open, onOpenChange, scheduleId }: AssignAgent
                       }
                       onChange={() => toggle(agent.id)}
                     />
-                    <label
-                      htmlFor={inputId}
-                      className={cn('min-w-0 flex-1', conflict ? 'cursor-not-allowed' : 'cursor-pointer')}
-                    >
-                      <span className="block truncate text-[14px] text-[var(--color-ink-900)]">{agent.name}</span>
-                      {agent.email && (
-                        <span className="block truncate text-[12px] text-[var(--color-ink-500)]">{agent.email}</span>
+                    {/* One column that owns the whole remaining width. The
+                        conflict reason used to sit here as a shrink-0 SIBLING
+                        of the name, so a long reason forced the row wider than
+                        the modal: the name collapsed to nothing and the Free
+                        button was pushed off-screen. Nesting it under the name
+                        lets the reason wrap downwards instead of outwards. */}
+                    <div className="min-w-0 flex-1">
+                      <label
+                        htmlFor={inputId}
+                        className={cn('block', conflict ? 'cursor-not-allowed' : 'cursor-pointer')}
+                      >
+                        <span className="block truncate text-[14px] text-[var(--color-ink-900)]">{agent.name}</span>
+                        {agent.email && (
+                          <span className="block truncate text-[12px] text-[var(--color-ink-500)]">{agent.email}</span>
+                        )}
+                      </label>
+
+                      {conflict && (
+                        <div className="mt-1.5 flex flex-col gap-1.5">
+                          {conflict.conflicts.map((other) => {
+                            const isFreeing =
+                              freeing?.agentId === agent.id && freeing.scheduleId === other.schedule_id
+
+                            return (
+                              <div key={other.schedule_id} className="flex items-start gap-2">
+                                <svg
+                                  className="mt-0.5 size-3.5 shrink-0 text-[var(--color-conflict)]"
+                                  viewBox="0 0 16 16"
+                                  fill="none"
+                                  aria-hidden="true"
+                                  focusable="false"
+                                >
+                                  <path d="M8 4.5v4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+                                  <circle cx="8" cy="11.25" r="0.9" fill="currentColor" />
+                                  <circle cx="8" cy="8" r="6.75" stroke="currentColor" strokeWidth="1.3" />
+                                </svg>
+                                {/* Read out with the checkbox via
+                                    `aria-describedby`, so the row announces both
+                                    that it is unavailable and why.
+                                    min-w-0 is what actually permits wrapping: a
+                                    flex child defaults to min-width:auto and
+                                    refuses to shrink below its content. */}
+                                <span
+                                  id={reasonId(other)}
+                                  className="tabular min-w-0 flex-1 text-[12px] leading-snug break-words text-[var(--color-conflict)]"
+                                >
+                                  {conflictReason(other)}
+                                </span>
+                                <Button
+                                  size="sm"
+                                  variant="secondary"
+                                  loading={isFreeing}
+                                  disabled={isAssigning || (freeing !== null && !isFreeing)}
+                                  aria-label={`Free ${agent.name} from ${other.schedule_name}`}
+                                  onClick={() => handleFree(agent.id, agent.name, other)}
+                                >
+                                  Free
+                                </Button>
+                              </div>
+                            )
+                          })}
+                        </div>
                       )}
-                    </label>
-
-                    {conflict && (
-                      <div className="flex shrink-0 flex-col items-end gap-1">
-                        {conflict.conflicts.map((other) => {
-                          const isFreeing =
-                            freeing?.agentId === agent.id && freeing.scheduleId === other.schedule_id
-
-                          return (
-                            <div key={other.schedule_id} className="flex items-center gap-2">
-                              <svg
-                                className="size-3.5 shrink-0 text-[var(--color-conflict)]"
-                                viewBox="0 0 16 16"
-                                fill="none"
-                                aria-hidden="true"
-                                focusable="false"
-                              >
-                                <path d="M8 4.5v4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-                                <circle cx="8" cy="11.25" r="0.9" fill="currentColor" />
-                                <circle cx="8" cy="8" r="6.75" stroke="currentColor" strokeWidth="1.3" />
-                              </svg>
-                              {/* Read out with the checkbox via
-                                  `aria-describedby`, so the row announces both
-                                  that it is unavailable and why. */}
-                              <span
-                                id={reasonId(other)}
-                                className="tabular text-[12px] text-[var(--color-conflict)]"
-                              >
-                                {conflictReason(other)}
-                              </span>
-                              <Button
-                                size="sm"
-                                variant="secondary"
-                                loading={isFreeing}
-                                disabled={isAssigning || (freeing !== null && !isFreeing)}
-                                aria-label={`Free ${agent.name} from ${other.schedule_name}`}
-                                onClick={() => handleFree(agent.id, agent.name, other)}
-                              >
-                                Free
-                              </Button>
-                            </div>
-                          )
-                        })}
-                      </div>
-                    )}
+                    </div>
                   </div>
                 )
               })}
