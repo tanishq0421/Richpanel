@@ -12,7 +12,7 @@ from app.components.schedules.model import Schedule
 from app.db import db_session_read, db_session_write
 from app.domain.overlap import find_overlaps
 from app.domain.types import WeekdayShift
-from app.errors.error import AssignmentOverlapError, NotFoundError
+from app.errors.error import AssignmentOverlapError, ConflictError, NotFoundError
 from app.services._conversions import weekday_shift_from_row
 
 logger = logging.getLogger("richpanel.assignment_service")
@@ -32,6 +32,19 @@ def assign_agent(schedule_id: int, agent_id: int) -> None:
         schedule = schedules_queries.get_schedule(session, schedule_id)
         if schedule is None:
             raise NotFoundError(f"schedule {schedule_id} not found")
+        if get_agent(session, agent_id) is None:
+            # Without this the insert below fails on the agents FK, which
+            # surfaced as a 500 rather than a 404.
+            raise NotFoundError(f"agent {agent_id} not found")
+
+        if agent_id in schedule_agents_queries.list_active_assignee_agent_ids(session, schedule_id):
+            # Must be caught before the overlap check: get_other_active_... is
+            # called WITHOUT exclude_schedule_id below (deliberately -- at assign
+            # time this schedule is not yet among the agent's schedules), so an
+            # already-assigned agent would otherwise be reported as overlapping
+            # itself, or hit the partial unique index and 500 when the schedule
+            # has no shifts to overlap.
+            raise ConflictError(f"agent {agent_id} is already assigned to schedule {schedule_id}")
 
         other_schedule_ids = schedule_agents_queries.get_other_active_schedule_ids_for_agent(session, agent_id)
         existing_shifts: list[WeekdayShift] = []

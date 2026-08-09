@@ -5,7 +5,7 @@ import pytest
 
 from app.db import db_session_write
 from app.domain.types import ShiftInput
-from app.errors.error import AssignmentOverlapError, NotFoundError
+from app.errors.error import AssignmentOverlapError, ConflictError, NotFoundError
 from app.services.assignment_service import (
     assign_agent,
     list_assignees,
@@ -94,6 +94,42 @@ def test_reassign_after_unassign_succeeds(db):
     assign_agent(schedule.id, agent_id)
 
     assert {a.id for a in list_assignees(schedule.id)} == {agent_id}
+
+
+def test_assign_nonexistent_agent_raises_not_found(db):
+    # Previously fell through to an agents FK violation -> 500.
+    schedule = create_schedule(name="A", start_date=date(2026, 1, 1), end_date=None, shift_inputs=[])
+    with pytest.raises(NotFoundError):
+        assign_agent(schedule.id, 999999)
+
+
+def test_duplicate_assignment_raises_conflict_not_overlap(db):
+    # Two distinct previous failures: with no shifts it violated the partial
+    # unique index (500); with shifts it reported the schedule as overlapping
+    # ITSELF, giving a 409 with a misleading message.
+    schedule = create_schedule(name="A", start_date=date(2026, 1, 1), end_date=None, shift_inputs=[])
+    agent_id = _create_agent()
+    assign_agent(schedule.id, agent_id)
+
+    with pytest.raises(ConflictError) as exc_info:
+        assign_agent(schedule.id, agent_id)
+    assert "already assigned" in str(exc_info.value)
+    assert not isinstance(exc_info.value, AssignmentOverlapError)
+
+
+def test_duplicate_assignment_conflicts_even_when_schedule_has_shifts(db):
+    schedule = create_schedule(
+        name="A",
+        start_date=date(2026, 1, 1),
+        end_date=None,
+        shift_inputs=[ShiftInput(weekday=0, start_time=timedelta(hours=9), end_time=timedelta(hours=17))],
+    )
+    agent_id = _create_agent()
+    assign_agent(schedule.id, agent_id)
+
+    with pytest.raises(ConflictError) as exc_info:
+        assign_agent(schedule.id, agent_id)
+    assert "already assigned" in str(exc_info.value)
 
 
 def test_list_schedules_for_agent_returns_active_schedules(db):
