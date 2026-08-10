@@ -1,6 +1,6 @@
 # backend/app/components/reports/queries.py
 from collections import defaultdict
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
@@ -43,12 +43,20 @@ def get_agent_hours_for_report(session: Session, report_id: int) -> list[Resolut
 
 def get_active_agent_schedule_pairs(
     session: Session, window_start: datetime, window_end: datetime
-) -> list[tuple[int, int | None]]:
+) -> list[tuple[int, int | None, date | None, date | None]]:
     """Every agent, paired with each active schedule whose effective date
     range overlaps the window. Agents with no matching schedule appear once
-    with schedule_id=None (0-hour contribution)."""
+    with schedule_id=None (0-hour contribution).
+
+    Also returns each matched schedule's own start_date/end_date (None when
+    schedule_id is None). This WHERE clause only decides whether a schedule is
+    considered at all -- it does not bound which of its hours count. A
+    schedule effective for one day inside a much wider report window still
+    passes this filter; the caller uses the returned dates to clip the hours
+    calculation down to the schedule's actual effective range within the
+    window, rather than crediting the whole window."""
     stmt = (
-        select(Agent.id, Schedule.id)
+        select(Agent.id, Schedule.id, Schedule.start_date, Schedule.end_date)
         .select_from(Agent)
         .outerjoin(
             ScheduleAgent,

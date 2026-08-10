@@ -65,9 +65,15 @@ def test_get_active_agent_schedule_pairs_includes_unassigned_agents(db):
 
     pairs = get_active_agent_schedule_pairs(db, datetime(2026, 6, 1), datetime(2026, 6, 2))
 
-    pairs_by_agent = {agent_id: schedule_id for agent_id, schedule_id in pairs}
+    pairs_by_agent = {agent_id: schedule_id for agent_id, schedule_id, _, _ in pairs}
     assert pairs_by_agent[unassigned.id] is None
     assert pairs_by_agent[assigned.id] == schedule.id
+
+    # The row also carries the matched schedule's own effective dates now --
+    # what the report service clips the hours calculation down to.
+    dated_row = next(row for row in pairs if row[0] == assigned.id)
+    assert dated_row[2] == date(2026, 1, 1)
+    assert dated_row[3] is None
 
 
 def test_get_active_agent_schedule_pairs_excludes_schedules_outside_date_range(db):
@@ -81,7 +87,7 @@ def test_get_active_agent_schedule_pairs_excludes_schedules_outside_date_range(d
 
     pairs = get_active_agent_schedule_pairs(db, datetime(2026, 6, 1), datetime(2026, 6, 2))
 
-    pairs_by_agent = {agent_id: schedule_id for agent_id, schedule_id in pairs}
+    pairs_by_agent = {agent_id: schedule_id for agent_id, schedule_id, _, _ in pairs}
     assert pairs_by_agent[agent.id] is None
 
 

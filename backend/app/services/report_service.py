@@ -2,7 +2,7 @@
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime, time as time_of_day, timedelta
 
 from app.components.reports import queries as reports_queries
 from app.db import db_session_read, db_session_write
@@ -45,6 +45,34 @@ class ReportResult:
     agent_hours: list[AgentHoursRow] = field(default_factory=list)
 
 
+def _clip_to_schedule_range(
+    window_start: datetime, window_end: datetime, schedule_start: date, schedule_end: date | None
+) -> tuple[datetime, datetime] | None:
+    """Intersect the report window with the schedule's own effective range, in
+    wall-clock terms. `schedule_end` is inclusive of that whole calendar day,
+    matching how the rest of the codebase already treats it (e.g. the coarse
+    SQL filter this feeds from: `end_date >= window_start.date()`).
+
+    Returns None when the intersection is empty. That can happen even though
+    get_active_agent_schedule_pairs already filtered at the DAY level: this
+    clip is exact to the minute, and that filter is not. Concretely, a
+    schedule whose start_date is the exact calendar day the window ends on
+    passes the day-level filter, but its effective start (that day's
+    midnight) can fall AT OR AFTER the window's own end -- an empty
+    intersection, not a bug in the filter. calculate_business_seconds raises
+    on window_end <= window_start rather than returning 0, so this case must
+    be caught here, before calling it, not left to surface as an error."""
+    effective_start = max(window_start, datetime.combine(schedule_start, time_of_day.min))
+    if schedule_end is not None:
+        exclusive_end = datetime.combine(schedule_end + timedelta(days=1), time_of_day.min)
+        effective_end = min(window_end, exclusive_end)
+    else:
+        effective_end = window_end
+    if effective_end <= effective_start:
+        return None
+    return effective_start, effective_end
+
+
 def generate_report(ticket_start_at: datetime, ticket_end_at: datetime) -> ReportResult:
     ticket_start_at = _to_ist(ticket_start_at)
     ticket_end_at = _to_ist(ticket_end_at)
@@ -55,7 +83,7 @@ def generate_report(ticket_start_at: datetime, ticket_end_at: datetime) -> Repor
     read_started = time.perf_counter()
     with db_session_read() as session:
         pairs = reports_queries.get_active_agent_schedule_pairs(session, ticket_start_at, ticket_end_at)
-        schedule_ids = sorted({sid for _, sid in pairs if sid is not None})
+        schedule_ids = sorted({sid for _, sid, _, _ in pairs if sid is not None})
         weekday_hours_by_schedule = reports_queries.get_weekday_hours_for_schedules(session, schedule_ids)
     read_ms = round((time.perf_counter() - read_started) * 1000, 2)
 
@@ -67,13 +95,31 @@ def generate_report(ticket_start_at: datetime, ticket_end_at: datetime) -> Repor
 
     window_start = _wall_clock(ticket_start_at)
     window_end = _wall_clock(ticket_end_at)
+
+    # Each distinct schedule's clipped window and resulting seconds are
+    # computed exactly ONCE, however many agents share that schedule -- the
+    # clip and the hours calculation both depend only on the schedule, never
+    # on which agent is asking, so recomputing per agent would be redundant
+    # work, not just a missed optimisation.
+    schedule_dates: dict[int, tuple[date, date | None]] = {
+        sid: (start, end) for _, sid, start, end in pairs if sid is not None
+    }
+    seconds_by_schedule: dict[int, int] = {}
+    for schedule_id, (schedule_start, schedule_end) in schedule_dates.items():
+        clipped = _clip_to_schedule_range(window_start, window_end, schedule_start, schedule_end)
+        if clipped is None:
+            seconds_by_schedule[schedule_id] = 0
+            continue
+        clip_start, clip_end = clipped
+        shifts = weekly_shifts_by_schedule.get(schedule_id, [])
+        seconds_by_schedule[schedule_id] = calculate_business_seconds(shifts, clip_start, clip_end)
+
     totals_by_agent: dict[int, int] = {}
-    for agent_id, schedule_id in pairs:
+    for agent_id, schedule_id, _, _ in pairs:
         totals_by_agent.setdefault(agent_id, 0)
         if schedule_id is None:
             continue
-        shifts = weekly_shifts_by_schedule.get(schedule_id, [])
-        totals_by_agent[agent_id] += calculate_business_seconds(shifts, window_start, window_end)
+        totals_by_agent[agent_id] += seconds_by_schedule[schedule_id]
     compute_ms = round((time.perf_counter() - compute_started) * 1000, 2)
 
     # 3. Write: fresh session, only to persist the already-computed result.

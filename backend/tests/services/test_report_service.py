@@ -51,6 +51,91 @@ def test_generate_report_includes_unassigned_agents_at_zero(db):
     assert row.business_seconds == 0
 
 
+def test_generate_report_clips_hours_to_the_schedules_effective_range(db):
+    # The headline bug: a schedule effective for ONE day inside a much wider
+    # report window used to be billed for the whole window. Effective range is
+    # exactly Jan 6 (a Tuesday); the report window spans two months and
+    # contains eight Tuesdays. Unclipped, this schedule's weekly pattern would
+    # be counted on all eight (64h). Clipped, only the one day it was actually
+    # effective counts.
+    schedule = create_schedule(
+        name="One Day Only",
+        start_date=date(2026, 1, 6),
+        end_date=date(2026, 1, 6),
+        shift_inputs=[ShiftInput(weekday=1, start_time=timedelta(hours=9), end_time=timedelta(hours=17))],
+    )
+    agent_id = _create_agent()
+    assign_agent(schedule.id, agent_id)
+
+    result = generate_report(ticket_start_at=datetime(2026, 1, 1, 0, 0, 0), ticket_end_at=datetime(2026, 3, 1, 0, 0, 0))
+
+    row = next(r for r in result.agent_hours if r.agent_id == agent_id)
+    assert row.business_seconds == 8 * 3600  # exactly the one Tuesday, not all eight
+
+
+def test_generate_report_credits_the_full_window_for_a_schedule_spanning_it(db):
+    # No-regression check: a schedule already effective for the ENTIRE report
+    # window must get exactly the same total as before clipping existed --
+    # the clip should be a no-op when there is nothing to clip.
+    schedule = create_schedule(
+        name="Long Runner",
+        start_date=date(2025, 1, 1),
+        end_date=None,  # ongoing
+        shift_inputs=[ShiftInput(weekday=wd, start_time=timedelta(hours=9), end_time=timedelta(hours=17)) for wd in range(5)],
+    )
+    agent_id = _create_agent()
+    assign_agent(schedule.id, agent_id)
+
+    # Monday 5 Jan 2026 00:00 -> the following Monday 00:00: one full Mon-Fri week.
+    result = generate_report(ticket_start_at=datetime(2026, 1, 5, 0, 0, 0), ticket_end_at=datetime(2026, 1, 12, 0, 0, 0))
+
+    row = next(r for r in result.agent_hours if r.agent_id == agent_id)
+    assert row.business_seconds == 40 * 3600  # five 8h days, unclipped
+
+
+def test_generate_report_clips_a_schedule_that_ends_mid_window(db):
+    # The complementary case to the "starts mid-window" test above: a schedule
+    # whose end_date falls partway through the window must stop counting
+    # after it, not carry on to the window's own end.
+    schedule = create_schedule(
+        name="Ends Mid Window",
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 1, 6),  # ends the same Tuesday it starts covering
+        shift_inputs=[ShiftInput(weekday=1, start_time=timedelta(hours=9), end_time=timedelta(hours=17))],
+    )
+    agent_id = _create_agent()
+    assign_agent(schedule.id, agent_id)
+
+    result = generate_report(ticket_start_at=datetime(2026, 1, 1, 0, 0, 0), ticket_end_at=datetime(2026, 3, 1, 0, 0, 0))
+
+    row = next(r for r in result.agent_hours if r.agent_id == agent_id)
+    assert row.business_seconds == 8 * 3600  # only the one Tuesday before end_date
+
+
+def test_generate_report_handles_a_schedule_whose_effective_start_lands_exactly_at_the_window_end(db):
+    # The edge case the fix specifically had to guard against: the coarse
+    # day-level filter (get_active_agent_schedule_pairs) still matches this
+    # schedule, but the exact datetime clip is empty -- the schedule's
+    # effective start (that day's midnight) is not strictly before the
+    # window's end. Before the guard, this would raise inside
+    # calculate_business_seconds (window_end <= window_start) instead of
+    # correctly reporting zero.
+    schedule = create_schedule(
+        name="Starts At The Wire",
+        start_date=date(2026, 1, 10),
+        end_date=None,
+        shift_inputs=[ShiftInput(weekday=5, start_time=timedelta(hours=9), end_time=timedelta(hours=17))],
+    )
+    agent_id = _create_agent()
+    assign_agent(schedule.id, agent_id)
+
+    # Window ends AT the exact instant the schedule becomes effective.
+    result = generate_report(ticket_start_at=datetime(2026, 1, 1, 0, 0, 0), ticket_end_at=datetime(2026, 1, 10, 0, 0, 0))
+
+    row = next(r for r in result.agent_hours if r.agent_id == agent_id)
+    assert row.business_seconds == 0  # not a crash, not a false credit
+
+
 def test_generate_report_persists_and_is_retrievable(db):
     generated = generate_report(
         ticket_start_at=datetime(2026, 1, 6, 10, 0, 0), ticket_end_at=datetime(2026, 1, 6, 14, 0, 0)
