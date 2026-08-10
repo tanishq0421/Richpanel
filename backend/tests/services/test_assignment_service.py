@@ -8,6 +8,7 @@ from app.domain.types import ShiftInput
 from app.errors.error import AssignmentOverlapError, ConflictError, NotFoundError
 from app.services.assignment_service import (
     assign_agent,
+    find_assignment_conflicts,
     list_assignees,
     list_schedules_for_agent,
     unassign_agent,
@@ -130,6 +131,95 @@ def test_duplicate_assignment_conflicts_even_when_schedule_has_shifts(db):
     with pytest.raises(ConflictError) as exc_info:
         assign_agent(schedule.id, agent_id)
     assert "already assigned" in str(exc_info.value)
+
+
+def test_assign_agent_succeeds_for_identical_hours_in_disjoint_date_ranges(db):
+    # Same weekday/hours, but the effective date ranges never coexist -- the
+    # agent could never actually work both at once, so this must not conflict.
+    # Previously find_overlaps compared weekday/time only and rejected this
+    # unconditionally, regardless of the dates.
+    schedule_a = create_schedule(
+        name="A",
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 1, 31),
+        shift_inputs=[ShiftInput(weekday=0, start_time=timedelta(hours=9), end_time=timedelta(hours=17))],
+    )
+    schedule_b = create_schedule(
+        name="B",
+        start_date=date(2026, 2, 1),
+        end_date=None,
+        shift_inputs=[ShiftInput(weekday=0, start_time=timedelta(hours=9), end_time=timedelta(hours=17))],
+    )
+    agent_id = _create_agent()
+
+    assign_agent(schedule_a.id, agent_id)
+    assign_agent(schedule_b.id, agent_id)
+
+    assert {a.id for a in list_assignees(schedule_b.id)} == {agent_id}
+
+
+def test_assign_agent_rejects_identical_hours_when_date_ranges_touch(db):
+    # Ranges are inclusive of end_date: sharing even one calendar day is enough.
+    schedule_a = create_schedule(
+        name="A",
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 1, 31),
+        shift_inputs=[ShiftInput(weekday=0, start_time=timedelta(hours=9), end_time=timedelta(hours=17))],
+    )
+    schedule_b = create_schedule(
+        name="B",
+        start_date=date(2026, 1, 31),
+        end_date=None,
+        shift_inputs=[ShiftInput(weekday=0, start_time=timedelta(hours=9), end_time=timedelta(hours=17))],
+    )
+    agent_id = _create_agent()
+    assign_agent(schedule_a.id, agent_id)
+
+    with pytest.raises(AssignmentOverlapError):
+        assign_agent(schedule_b.id, agent_id)
+
+
+def test_assign_agent_rejects_identical_hours_against_an_ongoing_schedule(db):
+    # end_date=None must act as infinity, not as "no date constraint" -- an
+    # ongoing schedule still conflicts with anything dated after it starts.
+    schedule_a = create_schedule(
+        name="A",
+        start_date=date(2026, 1, 1),
+        end_date=None,
+        shift_inputs=[ShiftInput(weekday=0, start_time=timedelta(hours=9), end_time=timedelta(hours=17))],
+    )
+    schedule_b = create_schedule(
+        name="B",
+        start_date=date(2027, 1, 1),
+        end_date=None,
+        shift_inputs=[ShiftInput(weekday=0, start_time=timedelta(hours=9), end_time=timedelta(hours=17))],
+    )
+    agent_id = _create_agent()
+    assign_agent(schedule_a.id, agent_id)
+
+    with pytest.raises(AssignmentOverlapError):
+        assign_agent(schedule_b.id, agent_id)
+
+
+def test_find_assignment_conflicts_reports_none_for_disjoint_date_ranges(db):
+    # The pre-flight check must agree with assign_agent's write-path check --
+    # both delegate to the same _conflicts_for_agents, so they can't disagree.
+    schedule_a = create_schedule(
+        name="A",
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 1, 31),
+        shift_inputs=[ShiftInput(weekday=0, start_time=timedelta(hours=9), end_time=timedelta(hours=17))],
+    )
+    schedule_b = create_schedule(
+        name="B",
+        start_date=date(2026, 2, 1),
+        end_date=None,
+        shift_inputs=[ShiftInput(weekday=0, start_time=timedelta(hours=9), end_time=timedelta(hours=17))],
+    )
+    agent_id = _create_agent()
+    assign_agent(schedule_a.id, agent_id)
+
+    assert find_assignment_conflicts(schedule_b.id, [agent_id]) == []
 
 
 def test_list_schedules_for_agent_returns_active_schedules(db):

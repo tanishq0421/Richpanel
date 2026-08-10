@@ -2,6 +2,7 @@
 import logging
 import time
 from dataclasses import dataclass
+from datetime import date
 
 from app.components.agents import queries as agents_queries
 from app.components.agents.model import Agent
@@ -14,7 +15,7 @@ from app.db import db_session_read, db_session_write
 from app.domain.overlap import Overlap, find_overlaps
 from app.domain.types import WeekdayShift
 from app.errors.error import AssignmentOverlapError, ConflictError, NotFoundError
-from app.services._conversions import weekday_shift_from_row
+from app.services._conversions import date_ranges_overlap, weekday_shift_from_row
 
 logger = logging.getLogger("richpanel.assignment_service")
 
@@ -42,7 +43,12 @@ class AgentConflict:
 
 
 def _conflicts_for_agents(
-    session, agent_ids: list[int], target_shifts: list[WeekdayShift], exclude_schedule_id: int | None
+    session,
+    agent_ids: list[int],
+    target_shifts: list[WeekdayShift],
+    target_start: date,
+    target_end: date | None,
+    exclude_schedule_id: int | None,
 ) -> dict[int, list[ScheduleConflict]]:
     """Batched form of the per-agent conflict check: for N candidate agents,
     issues one query for every OTHER active schedule id per agent, one query
@@ -54,7 +60,12 @@ def _conflicts_for_agents(
     Compares per schedule rather than against one flattened list of shifts.
     Flattening loses which schedule produced the collision, which is exactly
     the fact the UI needs in order to say 'Bob is on Night Shift' and offer to
-    remove him from it."""
+    remove him from it.
+
+    target_start/target_end are the TARGET schedule's own effective date
+    range. A candidate schedule whose range never coexists with it is skipped
+    before the weekday/time comparison runs -- domain.overlap stays date-free
+    by design, so date awareness lives here, at the call site."""
     other_ids_by_agent = schedule_agents_queries.get_other_active_schedule_ids_for_agents(
         session, agent_ids, exclude_schedule_id=exclude_schedule_id
     )
@@ -69,6 +80,8 @@ def _conflicts_for_agents(
             other = schedules_by_id.get(other_id)
             if other is None:
                 continue
+            if not date_ranges_overlap(target_start, target_end, other.start_date, other.end_date):
+                continue
             other_shifts = [weekday_shift_from_row(r) for r in hours_by_schedule.get(other_id, [])]
             overlaps = find_overlaps(other_shifts, target_shifts)
             if overlaps:
@@ -78,13 +91,20 @@ def _conflicts_for_agents(
 
 
 def _conflicts_for_agent(
-    session, agent_id: int, target_shifts: list[WeekdayShift], exclude_schedule_id: int | None
+    session,
+    agent_id: int,
+    target_shifts: list[WeekdayShift],
+    target_start: date,
+    target_end: date | None,
+    exclude_schedule_id: int | None,
 ) -> list[ScheduleConflict]:
     """Single-agent conflict check used by assign_agent's write path, where
     only one candidate is ever checked under the write lock. Delegates to the
     batched helper with a one-element list so both call sites share one code
     path and one query shape."""
-    return _conflicts_for_agents(session, [agent_id], target_shifts, exclude_schedule_id)[agent_id]
+    return _conflicts_for_agents(session, [agent_id], target_shifts, target_start, target_end, exclude_schedule_id)[
+        agent_id
+    ]
 
 
 def find_assignment_conflicts(schedule_id: int, agent_ids: list[int]) -> list[AgentConflict]:
@@ -96,7 +116,8 @@ def find_assignment_conflicts(schedule_id: int, agent_ids: list[int]) -> list[Ag
     It is advisory, not authoritative -- state can change between this call and
     the write -- so assign_agent still performs the real check under its lock."""
     with db_session_read() as session:
-        if schedules_queries.get_schedule(session, schedule_id) is None:
+        schedule = schedules_queries.get_schedule(session, schedule_id)
+        if schedule is None:
             raise NotFoundError(f"schedule {schedule_id} not found")
 
         target_shifts = _weekday_shifts_for_schedule(session, schedule_id)
@@ -108,7 +129,12 @@ def find_assignment_conflicts(schedule_id: int, agent_ids: list[int]) -> list[Ag
         agents_by_id = agents_queries.get_agents(session, candidate_ids)
         existing_candidate_ids = [aid for aid in candidate_ids if aid in agents_by_id]
         conflicts_by_agent = _conflicts_for_agents(
-            session, existing_candidate_ids, target_shifts, exclude_schedule_id=schedule_id
+            session,
+            existing_candidate_ids,
+            target_shifts,
+            schedule.start_date,
+            schedule.end_date,
+            exclude_schedule_id=schedule_id,
         )
 
         results: list[AgentConflict] = []
@@ -157,7 +183,9 @@ def assign_agent(schedule_id: int, agent_id: int) -> None:
         new_shifts = _weekday_shifts_for_schedule(session, schedule_id)
         # Same per-schedule comparison the pre-flight check uses, so the two can
         # never disagree about what counts as a conflict.
-        schedule_conflicts = _conflicts_for_agent(session, agent_id, new_shifts, exclude_schedule_id=schedule_id)
+        schedule_conflicts = _conflicts_for_agent(
+            session, agent_id, new_shifts, schedule.start_date, schedule.end_date, exclude_schedule_id=schedule_id
+        )
         if schedule_conflicts:
             logger.info(
                 "assignment rejected: overlap",

@@ -216,6 +216,68 @@ def test_update_schedule_rejects_hours_overlap_even_when_dates_also_change(db):
     assert unchanged.end_date == _day(30)
 
 
+def test_update_schedule_date_only_edit_resolves_an_existing_overlap(db):
+    # The bug this closes: re-validation used to compare weekday/time only, so
+    # a pure date-only edit that pulled two schedules' ranges apart was still
+    # rejected on save, even though it fixed the actual conflict.
+    schedule_a = create_schedule(
+        name="A",
+        start_date=_day(-10),
+        end_date=_day(20),
+        shift_inputs=[ShiftInput(weekday=0, start_time=timedelta(hours=9), end_time=timedelta(hours=13))],
+    )
+    schedule_b = create_schedule(
+        name="B",
+        start_date=_day(1),  # still in the future -- start_date stays editable
+        end_date=None,
+        shift_inputs=[ShiftInput(weekday=0, start_time=timedelta(hours=9), end_time=timedelta(hours=13))],
+    )
+    agent_id = _create_agent()
+    with db_session_write() as session:
+        create_assignment(session, schedule_a.id, agent_id)
+        create_assignment(session, schedule_b.id, agent_id)
+
+    # Hours resubmitted unchanged; only start_date moves past schedule_a's end.
+    updated = update_schedule(
+        schedule_b.id,
+        [ShiftInput(weekday=0, start_time=timedelta(hours=9), end_time=timedelta(hours=13))],
+        start_date=_day(25),
+    )
+
+    assert updated.start_date == _day(25)
+
+
+def test_update_schedule_date_only_edit_creates_a_new_overlap(db):
+    # The other direction: moving a schedule's dates INTO another schedule's
+    # range with matching hours must still be caught, not just hours edits.
+    schedule_a = create_schedule(
+        name="A",
+        start_date=_day(-10),
+        end_date=_day(20),
+        shift_inputs=[ShiftInput(weekday=0, start_time=timedelta(hours=9), end_time=timedelta(hours=13))],
+    )
+    schedule_b = create_schedule(
+        name="B",
+        start_date=_day(25),  # disjoint from A at creation time
+        end_date=None,
+        shift_inputs=[ShiftInput(weekday=0, start_time=timedelta(hours=9), end_time=timedelta(hours=13))],
+    )
+    agent_id = _create_agent()
+    with db_session_write() as session:
+        create_assignment(session, schedule_a.id, agent_id)
+        create_assignment(session, schedule_b.id, agent_id)
+
+    with pytest.raises(AssignmentOverlapError):
+        update_schedule(
+            schedule_b.id,
+            [ShiftInput(weekday=0, start_time=timedelta(hours=9), end_time=timedelta(hours=13))],
+            start_date=_day(15),  # now falls inside schedule_a's [-10, 20] range
+        )
+
+    unchanged = get_schedule_detail(schedule_b.id)
+    assert unchanged.start_date == _day(25)
+
+
 def test_get_deletion_impact_lists_affected_agents(db):
     schedule = create_schedule(name="A", start_date=date(2026, 1, 1), end_date=None, shift_inputs=[])
     agent_id = _create_agent()

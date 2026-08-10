@@ -17,7 +17,7 @@ from app.errors.error import (
     NotFoundError,
     ScheduleOverlapError,
 )
-from app.services._conversions import weekday_shift_from_row
+from app.services._conversions import date_ranges_overlap, weekday_shift_from_row
 
 logger = logging.getLogger("richpanel.schedule_service")
 
@@ -120,15 +120,20 @@ def _resolve_attribute_changes(
     name: str | Unchanged,
     start_date: date | Unchanged,
     end_date: date | None | Unchanged,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], date, date | None]:
     """Validate the requested schedule-level edits against what is stored, and
-    return only the fields that genuinely change.
+    return the fields that genuinely change, plus the schedule's EFFECTIVE
+    date range after this edit (stored values where a date was not sent).
 
     These rules live here rather than in the Pydantic request model because
     every one of them compares a sent value against a STORED one, which needs
     the row. They surface as DomainValidationError -> 400, which is precisely
     what that error is for; the request model still owns the rules decidable
-    from the payload alone (-> 422)."""
+    from the payload alone (-> 422).
+
+    The effective range is what update_schedule's overlap re-validation
+    compares against other schedules -- a date-only edit must be checked
+    against the NEW dates, not the ones about to be overwritten."""
     today = _today_ist()
 
     effective_start = schedule.start_date
@@ -169,11 +174,12 @@ def _resolve_attribute_changes(
         )
 
     requested = {"name": name, "start_date": start_date, "end_date": end_date}
-    return {
+    changes = {
         field: value
         for field, value in requested.items()
         if not isinstance(value, Unchanged) and value != getattr(schedule, field)
     }
+    return changes, effective_start, effective_end
 
 
 def update_schedule(
@@ -188,12 +194,12 @@ def update_schedule(
     edits. An omitted keyword leaves that field alone; `end_date=None` clears
     it, meaning the schedule is ongoing.
 
-    Changing the dates deliberately triggers no ADDITIONAL overlap check.
-    domain.overlap compares weekday and time-of-day only -- effective dates
-    never enter it -- so no date change can create or resolve an overlap today.
-    The hours re-validation below is unchanged and still runs on every call. If
-    date-aware overlap is ever implemented, that stops being true and this
-    function must re-check whenever the dates move, not only the hours."""
+    The re-validation below runs on every call, using the EFFECTIVE (post-edit)
+    date range from _resolve_attribute_changes -- so a pure date-only edit (
+    hours resubmitted unchanged) is checked against the new dates, and can
+    both create a conflict that didn't exist before and resolve one that did.
+    Two schedules with identical hours only conflict for a shared agent if
+    their date ranges also coexist (see _conversions.date_ranges_overlap)."""
     normalized_shifts = [ws for shift in shift_inputs for ws in normalize_shift(shift)]
 
     self_conflicts = find_self_overlaps(normalized_shifts)
@@ -218,15 +224,25 @@ def update_schedule(
         schedule = schedules_queries.get_schedule(session, schedule_id)
         if schedule is None:
             raise NotFoundError(f"schedule {schedule_id} not found")
-        attribute_changes = _resolve_attribute_changes(schedule, name, start_date, end_date)
+        attribute_changes, effective_start, effective_end = _resolve_attribute_changes(
+            schedule, name, start_date, end_date
+        )
 
         for agent_id in assignee_ids:
             other_schedule_ids = schedule_agents_queries.get_other_active_schedule_ids_for_agent(
                 session, agent_id, exclude_schedule_id=schedule_id
             )
+            other_schedules = schedules_queries.get_schedules(session, other_schedule_ids)
+            relevant_ids = [
+                oid
+                for oid in other_schedule_ids
+                if date_ranges_overlap(
+                    effective_start, effective_end, other_schedules[oid].start_date, other_schedules[oid].end_date
+                )
+            ]
             existing_shifts = [
                 weekday_shift_from_row(r)
-                for other_id in other_schedule_ids
+                for other_id in relevant_ids
                 for r in schedules_queries.get_weekday_hours_rows(session, other_id)
             ]
             conflicts = find_overlaps(existing_shifts, normalized_shifts)
