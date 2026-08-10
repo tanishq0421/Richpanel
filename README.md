@@ -326,7 +326,7 @@ cd frontend && npm run typecheck
 cd backend && uv run pytest -q
 ```
 
-**156 passed.** The backend tests need a real Postgres — they are integration
+**161 passed.** The backend tests need a real Postgres — they are integration
 tests by design, since advisory locks and partial unique indexes cannot be
 faked. `tests/conftest.py` forces `DATABASE_URL` to `DATABASE_URL_TEST`
 (default `postgresql+psycopg://localhost/richpanel_test`) *before* `app.db` is
@@ -336,7 +336,7 @@ imported, and truncates every table after each test.
 cd frontend && npx vitest run
 ```
 
-**171 passed across 7 test files** (jsdom + Testing Library).
+**178 passed across 7 test files** (jsdom + Testing Library).
 
 ### 3.6 Environment variables
 
@@ -455,7 +455,8 @@ bodies — read `git log` for the full reasoning behind any entry.
 - **Business hours are O(1)**, not a per-day loop. 4 queries whether the window is 1 day or 365.
 - **Overnight shifts split at storage** — primary row to 24:00, tail row from 0 the next weekday. Reduces overlap math to same-weekday comparisons.
 - **One time window per weekday**, enforced by a unique index plus a Pydantic check (the domain check alone misses non-overlapping same-day windows).
-- **`end_hours == 0` is rejected** (422) — ambiguous between "start of day" and "midnight tonight"; the message points to `23.99` as the workaround.
+- **`end_hours == 0` is rejected** (422) — ambiguous between "start of day" and "midnight tonight"; the message points to `24` as the workaround.
+- **`end_hours` can now reach `24`.** The validation range for `end_hours` used to be a blanket `< 24`, copied from the same bound used for `start_hours` — so an ordinary shift ending exactly at midnight (`22:00→24:00`) was rejected the same way as a genuine round-the-clock schedule, for any `start_hours`. Widened to `<= 24` in both the Pydantic schema and the domain `ShiftInput`, with an explicit `start=0, end=24` guard added so round-the-clock stays rejected (the existing `start == end` check doesn't catch that pair, since `0 != 24` as numbers). The UI's time picker gained a matching `includeEndOfDay` option — `24:00` is offered for a shift's end time only, never its start.
 - **A report can't cover a future window** (422) — would report scheduled hours as history.
 - **A schedule can't start in the past** — UI-only. The API itself still accepts it (unfixed, verified).
 - **A schedule's `start_date` can't be edited into the past either.** Was checking only the old value's elapsed-ness, not the new one. Fixed.
@@ -510,8 +511,8 @@ Everything below was measured on this checkout, not estimated.
 
 | Check | Result |
 |---|---|
-| `uv run pytest -q` (backend) | **156 passed** |
-| `npx vitest run` (frontend) | **171 passed**, 7 files |
+| `uv run pytest -q` (backend) | **161 passed** |
+| `npx vitest run` (frontend) | **178 passed**, 7 files |
 | `npx tsc -b --noEmit --force` | clean, no errors |
 | `npm run build` | clean |
 | `alembic current` | `0002 (head)` |
@@ -526,13 +527,6 @@ Everything below was measured on this checkout, not estimated.
 Deliberately specific. Do not read this project as finished.
 
 ### Correctness
-
-**`end_hours` cannot reach `24` at all, for any `start_hours`** — not just the
-round-the-clock case. The only check is a blanket `0 <= end_hours < 24`; there
-is no rule that specifically targets `start=0, end=24`. Side effect: an
-ordinary shift that legitimately ends at midnight (e.g. `22:00→24:00`, a
-2-hour shift) is currently inexpressible — rejected the same way, and for the
-same reason, as a genuine round-the-clock schedule. **Unresolved.**
 
 **Reports exclude soft-deleted schedules entirely.** The report query filters
 `Schedule.deleted_at IS NULL` with no reference to the report window, so
