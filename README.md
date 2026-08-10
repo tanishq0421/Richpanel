@@ -326,7 +326,7 @@ cd frontend && npm run typecheck
 cd backend && uv run pytest -q
 ```
 
-**146 passed.** The backend tests need a real Postgres — they are integration
+**150 passed.** The backend tests need a real Postgres — they are integration
 tests by design, since advisory locks and partial unique indexes cannot be
 faked. `tests/conftest.py` forces `DATABASE_URL` to `DATABASE_URL_TEST`
 (default `postgresql+psycopg://localhost/richpanel_test`) *before* `app.db` is
@@ -459,6 +459,7 @@ bodies — read `git log` for the full reasoning behind any entry.
 - **A report can't cover a future window** (422) — would report scheduled hours as history.
 - **A schedule can't start in the past** — UI-only. The API itself still accepts it (unfixed, verified).
 - **A schedule's `start_date` can't be edited into the past either.** Was checking only the old value's elapsed-ness, not the new one. Fixed.
+- **Report hours are clipped to each schedule's own effective range.** Used to bill the whole report window once a schedule's dates merely overlapped it — a schedule effective for 1 day inside a 2-month window was billed for the full 2 months. Fixed by intersecting the window with `[start_date, end_date]` per schedule before computing. Zero extra queries; still the same O(1) closed-form calculation, just given a (possibly narrower) window. One edge case guarded explicitly: a schedule whose effective start lands exactly at the window's end passes the coarse day-level filter but clips to a zero-width range — handled as 0 seconds, not a crash.
 
 ### 6.2 Data model
 
@@ -508,7 +509,7 @@ Everything below was measured on this checkout, not estimated.
 
 | Check | Result |
 |---|---|
-| `uv run pytest -q` (backend) | **146 passed** |
+| `uv run pytest -q` (backend) | **150 passed** |
 | `npx vitest run` (frontend) | **171 passed**, 7 files |
 | `npx tsc -b --noEmit --force` | clean, no errors |
 | `npm run build` | clean |
@@ -524,12 +525,6 @@ Everything below was measured on this checkout, not estimated.
 Deliberately specific. Do not read this project as finished.
 
 ### Correctness
-
-**Effective dates filter *which* schedules apply, but do not *clip* the hours.**
-`get_active_agent_schedule_pairs` selects schedules whose `[start_date, end_date]`
-overlaps the report window, and the hours calculation then runs over the **whole
-window**. A schedule effective for a single day inside a two-month report window
-is billed for the entire two months. **Unresolved.**
 
 **"Overlap" is judged on time-of-day only, ignoring effective dates.**
 `find_overlaps` compares weekday + time range. Two schedules with identical
