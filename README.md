@@ -326,7 +326,7 @@ cd frontend && npm run typecheck
 cd backend && uv run pytest -q
 ```
 
-**150 passed.** The backend tests need a real Postgres — they are integration
+**156 passed.** The backend tests need a real Postgres — they are integration
 tests by design, since advisory locks and partial unique indexes cannot be
 faked. `tests/conftest.py` forces `DATABASE_URL` to `DATABASE_URL_TEST`
 (default `postgresql+psycopg://localhost/richpanel_test`) *before* `app.db` is
@@ -460,6 +460,7 @@ bodies — read `git log` for the full reasoning behind any entry.
 - **A schedule can't start in the past** — UI-only. The API itself still accepts it (unfixed, verified).
 - **A schedule's `start_date` can't be edited into the past either.** Was checking only the old value's elapsed-ness, not the new one. Fixed.
 - **Report hours are clipped to each schedule's own effective range.** Used to bill the whole report window once a schedule's dates merely overlapped it — a schedule effective for 1 day inside a 2-month window was billed for the full 2 months. Fixed by intersecting the window with `[start_date, end_date]` per schedule before computing. Zero extra queries; still the same O(1) closed-form calculation, just given a (possibly narrower) window. One edge case guarded explicitly: a schedule whose effective start lands exactly at the window's end passes the coarse day-level filter but clips to a zero-width range — handled as 0 seconds, not a crash.
+- **Assignment overlap is now date-aware, not just weekday/time.** Two schedules with identical hours in disjoint date ranges used to be rejected as conflicting unconditionally — `find_overlaps` only ever compared weekday + time-of-day. Fixed at the call site, not inside `domain.overlap` (kept date-free by design): a `date_ranges_overlap` check now gates the weekday/time comparison in both the pre-flight check and the write path, which already shared one function so they can't disagree. `update_schedule`'s re-validation is now genuinely date-aware too — a pure date-only edit can both create and resolve a conflict, verified live against a rebuilt container.
 
 ### 6.2 Data model
 
@@ -509,7 +510,7 @@ Everything below was measured on this checkout, not estimated.
 
 | Check | Result |
 |---|---|
-| `uv run pytest -q` (backend) | **150 passed** |
+| `uv run pytest -q` (backend) | **156 passed** |
 | `npx vitest run` (frontend) | **171 passed**, 7 files |
 | `npx tsc -b --noEmit --force` | clean, no errors |
 | `npm run build` | clean |
@@ -525,14 +526,6 @@ Everything below was measured on this checkout, not estimated.
 Deliberately specific. Do not read this project as finished.
 
 ### Correctness
-
-**"Overlap" is judged on time-of-day only, ignoring effective dates.**
-`find_overlaps` compares weekday + time range. Two schedules with identical
-hours in completely non-overlapping date ranges (say Jan vs Dec) are therefore
-rejected as conflicting, even though no agent could ever work both at once.
-`update_schedule`'s own docstring flags this: a date-only edit re-validates
-nothing, because no date change can currently create or resolve an overlap.
-**Unresolved.**
 
 **`end_hours` cannot reach `24` at all, for any `start_hours`** — not just the
 round-the-clock case. The only check is a blanket `0 <= end_hours < 24`; there
