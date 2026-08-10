@@ -19,22 +19,27 @@ const DEFAULT_START_HOURS = 9
 const DEFAULT_END_HOURS = 17
 
 export const MIDNIGHT_END_MESSAGE =
-  'A shift cannot end at 00:00. Use 23:45 to cover the day right up to midnight.'
+  'A shift cannot end at 00:00. Use 24:00 to cover the day right up to midnight.'
 export const ZERO_LENGTH_MESSAGE =
   'Start and end cannot be the same time — the shift would have no length.'
+export const ROUND_THE_CLOCK_MESSAGE =
+  'A shift cannot run 00:00 to 24:00 — round-the-clock (24-hour) schedules are not supported.'
 
 /**
- * The two shapes the backend rejects with a 422. They are checked here, on the
- * exact keystroke that creates them, because both are indistinguishable to the
- * server from something the user might plausibly have meant: `end 00:00` reads
- * as "midnight" to a human but is a zero-hours day on the wire, and
- * `start === end` reads as "all day" but is stored as an empty window.
+ * The three shapes the backend rejects with a 422. They are checked here, on
+ * the exact keystroke that creates them, because all three are indistinguishable
+ * to the server from something the user might plausibly have meant: `end 00:00`
+ * reads as "midnight" to a human but is a zero-hours day on the wire, `start
+ * === end` reads as "all day" but is stored as an empty window, and `00:00`
+ * to `24:00` reads as "one long shift" but is the same round-the-clock case
+ * spelled with the day's other boundary.
  *
  * Exported so a page can reuse the same rule rather than re-deriving it.
  */
 export function shiftError(startHHMM: string, endHHMM: string): string | null {
   if (endHHMM === '00:00') return MIDNIGHT_END_MESSAGE
   if (startHHMM === endHHMM) return ZERO_LENGTH_MESSAGE
+  if (startHHMM === '00:00' && endHHMM === '24:00') return ROUND_THE_CLOCK_MESSAGE
   return null
 }
 
@@ -131,7 +136,13 @@ function PresetBar({ disabled, onApply }: { disabled: boolean; onApply: (shifts:
           </div>
           <span className="text-[13px] text-[var(--color-ink-500)]">to</span>
           <div className="w-[112px]">
-            <TimePicker value={end} onChange={setEnd} aria-label="Common end time" disabled={disabled} />
+            <TimePicker
+              value={end}
+              onChange={setEnd}
+              aria-label="Common end time"
+              disabled={disabled}
+              includeEndOfDay
+            />
           </div>
           {/* The shift chips are two spellings of the same control, so they stay
               on one line together — wrapping "Night shift" under "Business
@@ -458,6 +469,7 @@ const DayRow = memo(function DayRow({
             onChange={(next) => commit(startHHMM, next)}
             aria-label={`${long} end time`}
             disabled={disabled || !worked}
+            includeEndOfDay
           />
         </div>
 

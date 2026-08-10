@@ -220,15 +220,15 @@ describe('WeeklyHoursEditor — an overnight tail colliding with its own landing
   })
 })
 
-describe('WeeklyHoursEditor — the two shapes the backend rejects', () => {
-  it('blocks an end of 00:00 and suggests 23:45', () => {
+describe('WeeklyHoursEditor — the three shapes the backend rejects', () => {
+  it('blocks an end of 00:00 and suggests 24:00', () => {
     const onChange = vi.fn()
     render(<Harness onChange={onChange} initial={[{ weekday: 0, start_hours: 9, end_hours: 17 }]} />)
 
     setTime('Monday end time', '00:00')
 
     expect(onChange).not.toHaveBeenCalled()
-    expect(screen.getByText(/cannot end at 00:00/i)).toHaveTextContent('23:45')
+    expect(screen.getByText(/cannot end at 00:00/i)).toHaveTextContent('24:00')
     // The rejected value stays on screen — snapping silently back would read as
     // a broken control rather than a rule.
     expect(screen.getByLabelText('Monday end time')).toHaveValue('00:00')
@@ -242,6 +242,28 @@ describe('WeeklyHoursEditor — the two shapes the backend rejects', () => {
 
     expect(onChange).not.toHaveBeenCalled()
     expect(screen.getByText(/cannot be the same time/i)).toBeInTheDocument()
+  })
+
+  it('blocks a round-the-clock 00:00 to 24:00 shift', () => {
+    const onChange = vi.fn()
+    // Starts already at 00:00 so the one edit under test is the end time --
+    // a single commit attempt, cleanly asserting it never reaches onChange.
+    render(<Harness onChange={onChange} initial={[{ weekday: 0, start_hours: 0, end_hours: 17 }]} />)
+
+    setTime('Monday end time', '24:00')
+
+    expect(onChange).not.toHaveBeenCalled()
+    expect(screen.getByText(/round-the-clock/i)).toBeInTheDocument()
+  })
+
+  it('accepts an ordinary shift ending exactly at midnight', () => {
+    const onChange = vi.fn()
+    render(<Harness onChange={onChange} initial={[{ weekday: 0, start_hours: 9, end_hours: 17 }]} />)
+
+    setTime('Monday start time', '22:00')
+    setTime('Monday end time', '24:00')
+
+    expect(onChange).toHaveBeenCalledWith([{ weekday: 0, start_hours: 22, end_hours: 24 }])
   })
 
   it('recovers as soon as a valid time is chosen', () => {
@@ -466,7 +488,7 @@ describe('WeeklyHoursEditor — the common time the presets apply', () => {
 
     setTime('Common end time', '00:00')
 
-    expect(screen.getByText(/cannot end at 00:00/i)).toHaveTextContent('23:45')
+    expect(screen.getByText(/cannot end at 00:00/i)).toHaveTextContent('24:00')
     for (const name of [/^Set Monday to Friday/, /^Set Saturday and Sunday/, /^Set Every day/]) {
       expect(screen.getByRole('button', { name })).toBeDisabled()
     }

@@ -5,10 +5,12 @@
 export type Weekday = 0 | 1 | 2 | 3 | 4 | 5 | 6
 
 /**
- * Hours are floats on the wire: 22.5 means 22:30.
+ * Hours are floats on the wire: 22.5 means 22:30. `end_hours` may reach 24
+ * (same-day, ending exactly at midnight); `start_hours` may not.
  * `end_hours < start_hours` means the shift crosses midnight.
- * `end_hours === 0` is rejected by the backend (422) — a shift ending at
- * midnight is not supported.
+ * The backend rejects (422): `end_hours === 0` (ambiguous -- use 24 instead),
+ * `start_hours === end_hours`, and `start_hours === 0 && end_hours === 24`
+ * (both spellings of round-the-clock).
  */
 export interface ShiftDTO {
   weekday: Weekday

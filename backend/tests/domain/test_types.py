@@ -25,6 +25,26 @@ def test_shift_input_rejects_invalid_weekday():
         ShiftInput(weekday=7, start_time=timedelta(hours=9), end_time=timedelta(hours=17))
 
 
+def test_shift_input_accepts_end_of_day_boundary():
+    # An ordinary shift ending exactly at midnight -- distinct from the
+    # round-the-clock case, which is rejected explicitly below.
+    s = ShiftInput(weekday=0, start_time=timedelta(hours=22), end_time=timedelta(hours=24))
+    assert s.crosses_midnight is False
+
+
+def test_shift_input_rejects_round_the_clock_via_end_of_day():
+    # start=0, end=24 is round-the-clock spelled with the day's other
+    # boundary -- start_time == end_time alone would not catch this, since
+    # timedelta(hours=0) != timedelta(hours=24).
+    with pytest.raises(ValueError, match="round-the-clock"):
+        ShiftInput(weekday=0, start_time=timedelta(0), end_time=timedelta(hours=24))
+
+
+def test_shift_input_rejects_start_time_at_end_of_day():
+    with pytest.raises(ValueError, match="start_time"):
+        ShiftInput(weekday=0, start_time=timedelta(hours=24), end_time=timedelta(hours=1))
+
+
 def test_weekday_shift_rejects_end_before_or_equal_start():
     with pytest.raises(ValueError, match="same-day"):
         WeekdayShift(weekday=0, start_time=timedelta(hours=22), end_time=timedelta(hours=6))

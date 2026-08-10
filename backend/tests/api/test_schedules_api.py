@@ -86,6 +86,30 @@ def test_shift_ending_at_midnight_returns_422(db):
     assert response.status_code == 422
 
 
+def test_shift_ending_at_the_day_boundary_is_accepted_and_round_trips(db):
+    # end_hours=24 used to be blanket-rejected by the same `< 24` bound used
+    # for start_hours, making an ordinary midnight-ending shift (distinct from
+    # round-the-clock) inexpressible. 22:00->24:00 is a plain 2-hour shift.
+    response = _post_schedule(shifts=[{"weekday": 0, "start_hours": 22, "end_hours": 24}])
+    assert response.status_code == 201, response.text
+    schedule_id = response.json()["id"]
+    assert response.json()["shifts"] == [{"weekday": 0, "start_hours": 22.0, "end_hours": 24.0}]
+
+    # And it survives a read back unchanged -- recombine_shifts must not
+    # mistake this same-day shift for an overnight primary with a missing tail.
+    get_response = client.get(f"/api/v1/schedules/{schedule_id}")
+    assert get_response.json()["shifts"] == [{"weekday": 0, "start_hours": 22.0, "end_hours": 24.0}]
+
+
+def test_round_the_clock_via_start_zero_end_24_returns_422(db):
+    # start_hours == end_hours (e.g. 9 == 9) already covers most spellings of
+    # round-the-clock; 0/24 is the one pair that widening end_hours to 24
+    # would otherwise sneak past that check, since 0 != 24 as numbers.
+    response = _post_schedule(shifts=[{"weekday": 0, "start_hours": 0, "end_hours": 24}])
+    assert response.status_code == 422
+    assert "round-the-clock" in response.text
+
+
 def test_end_date_before_start_date_returns_422(db):
     # Previously only the database CHECK caught this -> IntegrityError -> 500.
     response = _post_schedule(start_date="2026-06-01", end_date="2026-01-01")

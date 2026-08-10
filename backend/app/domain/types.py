@@ -29,10 +29,16 @@ class ShiftInput:
             raise ValueError(f"weekday must be 0-6, got {self.weekday}")
         if not (ZERO <= self.start_time < END_OF_DAY):
             raise ValueError(f"start_time must be in [0, 24h), got {self.start_time}")
-        if not (ZERO <= self.end_time < END_OF_DAY):
-            raise ValueError(f"end_time must be in [0, 24h), got {self.end_time}")
+        # end_time may reach END_OF_DAY -- a shift ending exactly at midnight,
+        # same-day (e.g. 22:00->24:00), is legitimate and does not cross into
+        # the next weekday. start_time stays strictly < 24h; only end_time can
+        # be the day boundary.
+        if not (ZERO <= self.end_time <= END_OF_DAY):
+            raise ValueError(f"end_time must be in [0, 24h], got {self.end_time}")
         if self.start_time == self.end_time:
             raise ValueError("shift cannot have zero duration (start_time == end_time)")
+        if self.start_time == ZERO and self.end_time == END_OF_DAY:
+            raise ValueError("round-the-clock (24-hour) shifts are not supported")
 
     @property
     def crosses_midnight(self) -> bool:

@@ -291,6 +291,43 @@ describe('TimePicker', () => {
       expect(unavailable).toHaveLength(0)
     })
   })
+
+  describe('with includeEndOfDay', () => {
+    it('offers 24:00 as the final option', async () => {
+      const user = userEvent.setup()
+      render(<TimePicker value="09:00" onChange={vi.fn()} label="Shift end" includeEndOfDay />)
+
+      await user.click(screen.getByRole('button', { name: /shift end/i }))
+      const listbox = await screen.findByRole('listbox')
+
+      const labels = within(listbox)
+        .getAllByRole('option')
+        .map((option) => option.textContent)
+      expect(labels).toEqual([...timeOptions(), '24:00'])
+    })
+
+    it('commits 24:00 when selected', async () => {
+      const user = userEvent.setup()
+      const onChange = vi.fn()
+      render(<TimePicker value="22:00" onChange={onChange} label="Shift end" includeEndOfDay />)
+
+      await user.click(screen.getByRole('button', { name: /shift end/i }))
+      const listbox = await screen.findByRole('listbox')
+      await user.click(within(listbox).getByRole('option', { name: '24:00' }))
+
+      expect(onChange).toHaveBeenCalledWith('24:00')
+    })
+
+    it('does not add 24:00 when the prop is omitted', async () => {
+      const user = userEvent.setup()
+      render(<TimePicker value="09:00" onChange={vi.fn()} label="Shift start" />)
+
+      await user.click(screen.getByRole('button', { name: /shift start/i }))
+      const listbox = await screen.findByRole('listbox')
+
+      expect(within(listbox).queryByRole('option', { name: '24:00' })).toBeNull()
+    })
+  })
 })
 
 describe('DateTimeField', () => {

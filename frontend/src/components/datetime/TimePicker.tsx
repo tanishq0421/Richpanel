@@ -12,6 +12,12 @@ import {
 /** Every quarter hour of the day. Constant: the list never varies at runtime. */
 const OPTIONS = timeOptions()
 
+/** OPTIONS plus a same-day 24:00, for pickers where the caller opts in via
+ *  `includeEndOfDay` (a shift's END time only -- a start time must stay
+ *  strictly before the day boundary, so it never gets this list). Appended
+ *  rather than merged: 24:00 sorts after every other option already. */
+const OPTIONS_WITH_END_OF_DAY = [...OPTIONS, '24:00']
+
 /** How long consecutive keystrokes count as one typeahead word. */
 const TYPEAHEAD_WINDOW_MS = 800
 
@@ -24,8 +30,8 @@ const ROWS_PER_HOUR = 4
  * arrives from the API off-grid) still opens with a sensible row highlighted
  * instead of silently jumping to midnight.
  */
-function indexForValue(value: string): number {
-  const exact = OPTIONS.indexOf(value)
+function indexForValue(options: string[], value: string): number {
+  const exact = options.indexOf(value)
   if (exact !== -1) return exact
 
   let target: number
@@ -37,7 +43,7 @@ function indexForValue(value: string): number {
 
   let best = 0
   let bestDelta = Number.POSITIVE_INFINITY
-  OPTIONS.forEach((option, index) => {
+  options.forEach((option, index) => {
     const delta = Math.abs(hhmmToHours(option) - target)
     if (delta < bestDelta) {
       bestDelta = delta
@@ -51,10 +57,10 @@ function indexForValue(value: string): number {
  * "22" → 22:00, "9" → 09:00. The zero-pad retry is what makes single-digit
  * hours reachable at all: no option literally starts with "9".
  */
-function indexForTypeahead(buffer: string): number {
-  const direct = OPTIONS.findIndex((option) => option.startsWith(buffer))
+function indexForTypeahead(options: string[], buffer: string): number {
+  const direct = options.findIndex((option) => option.startsWith(buffer))
   if (direct !== -1) return direct
-  if (/^\d$/.test(buffer)) return OPTIONS.findIndex((option) => option.startsWith(`0${buffer}`))
+  if (/^\d$/.test(buffer)) return options.findIndex((option) => option.startsWith(`0${buffer}`))
   return -1
 }
 
@@ -67,8 +73,8 @@ function indexForTypeahead(buffer: string): number {
  * Never returns -1: 00:00 stays reachable whatever the ceiling, so the listbox
  * is never empty and `activeIndex` always addresses a real row.
  */
-function lastAllowedIndex(maxTime?: string): number {
-  if (!maxTime) return OPTIONS.length - 1
+function lastAllowedIndex(options: string[], maxTime?: string): number {
+  if (!maxTime) return options.length - 1
 
   let ceiling: number
   try {
@@ -76,11 +82,11 @@ function lastAllowedIndex(maxTime?: string): number {
   } catch {
     // An unparseable bound is dropped rather than obeyed: silently offering
     // nothing but midnight would be a far stranger failure than no bound.
-    return OPTIONS.length - 1
+    return options.length - 1
   }
 
   let last = 0
-  OPTIONS.forEach((option, index) => {
+  options.forEach((option, index) => {
     if (hhmmToHours(option) <= ceiling) last = index
   })
   return last
@@ -117,6 +123,10 @@ export interface TimePickerProps {
    * listbox is described by. Omit for an unbounded day.
    */
   maxTime?: string
+  /** Offer 24:00 as the final row, one past the last quarter-hour. Only a
+   *  shift's END time should ever set this -- a START time must stay
+   *  strictly before the day boundary, so it always omits this prop. */
+  includeEndOfDay?: boolean
 }
 
 /**
@@ -138,6 +148,7 @@ export function TimePicker({
   id,
   disabled,
   maxTime,
+  includeEndOfDay,
 }: TimePickerProps) {
   const generatedId = useId()
   const triggerId = id ?? `time-${generatedId}`
@@ -148,12 +159,14 @@ export function TimePicker({
   const noteId = `${triggerId}-bound`
   const optionId = (index: number) => `${triggerId}-option-${index}`
 
+  const options = includeEndOfDay ? OPTIONS_WITH_END_OF_DAY : OPTIONS
+
   // Recomputed every render rather than memoised: `maxTime` follows the clock,
   // so a stale bound is the one failure mode worth ruling out. 96 comparisons.
-  const maxIndex = lastAllowedIndex(maxTime)
+  const maxIndex = lastAllowedIndex(options, maxTime)
 
   const [open, setOpen] = useState(false)
-  const [activeIndex, setActiveIndex] = useState(() => indexForValue(value))
+  const [activeIndex, setActiveIndex] = useState(() => indexForValue(options, value))
 
   const listRef = useRef<HTMLDivElement>(null)
   const typeahead = useRef({ buffer: '', at: 0 })
@@ -170,14 +183,14 @@ export function TimePicker({
     if (next) {
       // A value that has since fallen out of range (the clock moved on under an
       // open tab) still has to open on a real row — the last one allowed.
-      setActiveIndex(Math.min(indexForValue(value), maxIndex))
+      setActiveIndex(Math.min(indexForValue(options, value), maxIndex))
       typeahead.current = { buffer: '', at: 0 }
     }
   }
 
   function commit(index: number) {
     if (index > maxIndex) return
-    onChange(OPTIONS[index])
+    onChange(options[index])
     setOpen(false)
   }
 
@@ -225,7 +238,7 @@ export function TimePicker({
 
     // Typing "22" when only up to 14:30 is available must not land on a row the
     // user cannot then select — the keystroke is simply ignored.
-    const found = indexForTypeahead(buffer)
+    const found = indexForTypeahead(options, buffer)
     if (found !== -1 && found <= maxIndex) {
       event.preventDefault()
       setActiveIndex(found)
@@ -301,7 +314,7 @@ export function TimePicker({
               onKeyDown={handleListKeyDown}
               className="max-h-64 w-[132px] overflow-y-auto outline-none"
             >
-              {OPTIONS.map((option, index) => {
+              {options.map((option, index) => {
                 const outOfRange = index > maxIndex
                 return (
                   <div

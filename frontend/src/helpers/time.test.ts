@@ -16,8 +16,13 @@ describe('float hours <-> HH:MM', () => {
     [0, '00:00'],
     [23.75, '23:45'],
     [13.25, '13:15'],
+    [24, '24:00'],
   ])('formats %s as %s', (hours, expected) => {
     expect(hoursToHHMM(hours)).toBe(expected)
+  })
+
+  it('parses 24:00 back to 24 hours', () => {
+    expect(hhmmToHours('24:00')).toBe(24)
   })
 
   it('round-trips every option the picker offers', () => {

@@ -17,14 +17,17 @@ class ShiftInputSchema(BaseModel):
             raise ValueError("weekday must be 0-6")
         if not (0 <= self.start_hours < 24):
             raise ValueError("start_hours must be in [0, 24)")
-        if not (0 <= self.end_hours < 24):
-            raise ValueError("end_hours must be in [0, 24)")
+        # end_hours may reach 24 -- a shift ending exactly at midnight, same
+        # day (e.g. 22:00->24:00), is legitimate and distinct from the
+        # round-the-clock case, which is rejected explicitly below instead.
+        if not (0 <= self.end_hours <= 24):
+            raise ValueError("end_hours must be in [0, 24]")
         # Relational rules belong here, not deeper. Previously these fell through
         # to a bare ValueError in the domain dataclass (raised inside the router
         # body) or to a database constraint -- both surfaced as a 500 on ordinary
         # input a user can type into the form. Pydantic turns them into a 422
         # naming the offending field.
-        if self.start_hours == self.end_hours:
+        if self.start_hours == self.end_hours or (self.start_hours == 0 and self.end_hours == 24):
             raise ValueError(
                 "a shift cannot start and end at the same time; "
                 "round-the-clock (24-hour) schedules are not supported"
@@ -35,7 +38,7 @@ class ShiftInputSchema(BaseModel):
             # failing deep in normalisation.
             raise ValueError(
                 "end_hours must not be 0; a shift ending at midnight is not "
-                "supported -- use 23.99 for a shift running to the end of the day"
+                "supported -- use 24 for a shift running to the end of the day"
             )
         return self
 
