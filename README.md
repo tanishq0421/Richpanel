@@ -455,7 +455,7 @@ bodies — read `git log` for the full reasoning behind any entry.
 - **Business hours are O(1)**, not a per-day loop. 4 queries whether the window is 1 day or 365.
 - **Overnight shifts split at storage** — primary row to 24:00, tail row from 0 the next weekday. Reduces overlap math to same-weekday comparisons.
 - **One time window per weekday**, enforced by a unique index plus a Pydantic check (the domain check alone misses non-overlapping same-day windows).
-- **24-hour schedules unsupported** — `end_hours` of `0` or `24` both 422.
+- **`end_hours == 0` is rejected** (422) — ambiguous between "start of day" and "midnight tonight"; the message points to `23.99` as the workaround.
 - **A report can't cover a future window** (422) — would report scheduled hours as history.
 - **A schedule can't start in the past** — UI-only. The API itself still accepts it (unfixed, verified).
 - **A schedule's `start_date` can't be edited into the past either.** Was checking only the old value's elapsed-ness, not the new one. Fixed.
@@ -538,6 +538,13 @@ rejected as conflicting, even though no agent could ever work both at once.
 `update_schedule`'s own docstring flags this: a date-only edit re-validates
 nothing, because no date change can currently create or resolve an overlap.
 **Unresolved.**
+
+**`end_hours` cannot reach `24` at all, for any `start_hours`** — not just the
+round-the-clock case. The only check is a blanket `0 <= end_hours < 24`; there
+is no rule that specifically targets `start=0, end=24`. Side effect: an
+ordinary shift that legitimately ends at midnight (e.g. `22:00→24:00`, a
+2-hour shift) is currently inexpressible — rejected the same way, and for the
+same reason, as a genuine round-the-clock schedule. **Unresolved.**
 
 **Reports exclude soft-deleted schedules entirely.** The report query filters
 `Schedule.deleted_at IS NULL` with no reference to the report window, so
